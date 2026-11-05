@@ -112,3 +112,76 @@ test("webhook enforces secret and accepts a single guess, then reveals once", as
   assert.equal(sql.prepare("SELECT points FROM guesses").get().points, 5000);
   sql.close();
 });
+
+test("manual MP4 round streams a private Drive file into Telegram once", async (t) => {
+  const { sql, DB } = database();
+  const calls = [];
+  const background = [];
+  const format = new TextEncoder();
+  const fixture = format.encode("test mp4 fixture");
+  const keys = await crypto.subtle.generateKey({
+    name: "RSASSA-PKCS1-v1_5", modulusLength: 1024,
+    publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256",
+  }, true, ["sign", "verify"]);
+  const pem = "-----BEGIN PRIVATE KEY-----\n" +
+    Buffer.from(await crypto.subtle.exportKey("pkcs8", keys.privateKey)).toString("base64") +
+    "\n-----END PRIVATE KEY-----";
+  const oldStream = globalThis.FixedLengthStream;
+  globalThis.FixedLengthStream = class extends TransformStream {
+    constructor() { super(); }
+  };
+  t.after(() => {
+    if (oldStream === undefined) delete globalThis.FixedLengthStream;
+    else globalThis.FixedLengthStream = oldStream;
+  });
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    const api = new URL(url);
+    if (api.hostname === "oauth2.googleapis.com") {
+      assert.ok(options.body.get("assertion").split(".").length === 3);
+      return Response.json({ access_token: "fake-access", expires_in: 3600 });
+    }
+    if (api.hostname === "www.googleapis.com") {
+      assert.equal(options.headers.Authorization, "Bearer fake-access");
+      if (api.pathname.endsWith("/demo-root")) {
+        return Response.json({ mimeType: "application/vnd.google-apps.folder" });
+      }
+      if (api.pathname.endsWith("/fake-file")) {
+        assert.equal(api.searchParams.get("alt"), "media");
+        return new Response(fixture);
+      }
+      if (api.searchParams.get("q").startsWith("'demo-root'")) {
+        return Response.json({ files: [{ id: "demo-folder", name: "35.0116, 135.7681" }] });
+      }
+      return Response.json({
+        files: [{ id: "fake-file", mimeType: "video/mp4", size: String(fixture.length), capabilities: { canDownload: true } }],
+      });
+    }
+    calls.push(api.pathname.split("/").at(-1));
+    if (api.pathname.endsWith("/sendVideo")) {
+      const media = await new Response(options.body).text();
+      assert.match(media, /filename="round-1.mp4"/);
+      assert.match(media, /test mp4 fixture/);
+      assert.match(media, /round_1/);
+      assert.ok(!media.includes("35.0116"));
+    }
+    return Response.json({ ok: true, result: { message_id: 321 } });
+  });
+  const env = {
+    DB, BOT_TOKEN: "test-token", WEBHOOK_SECRET: "secret", ADMIN_IDS: "42", DRIVE_ROOT: "demo-root",
+    DRIVE_SERVICE_ACCOUNT: JSON.stringify({ type: "service_account", client_email: "fake@example.test", private_key: pem }),
+  };
+  const ctx = { waitUntil: (promise) => background.push(promise) };
+  const next = () => worker.fetch(new Request("https://bot.example/telegram", {
+    method: "POST", headers: { "X-Telegram-Bot-Api-Secret-Token": "secret" },
+    body: JSON.stringify({ update_id: 5, message: { chat: { type: "private", id: 42 }, from: { id: 42 }, text: "/next" } }),
+  }), env, ctx);
+  assert.match((await (await next()).json()).text, /запускаю раунд/);
+  await Promise.all(background.splice(0));
+  await next();
+  await Promise.all(background.splice(0));
+  assert.deepEqual(calls, ["sendVideo", "sendMessage"]);
+  const round = sql.prepare("SELECT status,message_id FROM rounds WHERE id=1").get();
+  assert.equal(round.status, "active");
+  assert.equal(round.message_id, 321);
+  sql.close();
+});
