@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import urllib.error
 import urllib.parse
@@ -14,7 +15,10 @@ from prepare_video import prepare
 
 def main() -> int:
     origin = os.environ["ITMOGUESSR_MEDIA_ORIGIN"].rstrip("/")
-    headers = {"X-ITMOGUESSR-Media-Key": os.environ["ITMOGUESSR_MEDIA_KEY"]}
+    headers = {
+        "X-ITMOGUESSR-Media-Key": os.environ["ITMOGUESSR_MEDIA_KEY"].strip(),
+        "User-Agent": "ITMOGUESSR-Video-Worker/1.0",
+    }
 
     def request(path, *, method="GET", body=None, extra=None):
         return urllib.request.urlopen(urllib.request.Request(
@@ -45,7 +49,7 @@ def main() -> int:
             except urllib.error.HTTPError as error:
                 print(f"Media preparation HTTP {error.code}")
                 errors += 1
-            except (OSError, ValueError, KeyError) as error:
+            except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
                 print(f"Media preparation failed ({type(error).__name__})")
                 errors += 1
             if prepared >= 2:
