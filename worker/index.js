@@ -16,6 +16,11 @@ const mediaTypes = {
   "video/mp4": ["sendVideo", "video", "mp4", 50_000_000],
   "image/gif": ["sendAnimation", "animation", "gif", 50_000_000],
 };
+const convertibleVideo = new Set(["video/mp4", "video/quicktime", "video/webm", "video/x-matroska"]);
+const sourceTypes = [...new Set([...Object.keys(mediaTypes), ...convertibleVideo])];
+const mediaQuery = sourceTypes.map((type) => `mimeType='${type}'`).join(" or ");
+const maxSourceBytes = 1_000_000_000;
+const driveFields = "nextPageToken,files(id,name,mimeType,size,version,parents,capabilities(canDownload),videoMediaMetadata(width,height,durationMillis))";
 const encode = new TextEncoder();
 const dateParts = new Intl.DateTimeFormat("en-CA", {
   timeZone: game.timezone, year: "numeric", month: "2-digit", day: "2-digit",
@@ -30,12 +35,18 @@ const announcementChat = (env) => env.TELEGRAM_ANNOUNCEMENT_CHANNEL || chat(env)
 const db = (env, query, ...params) => env.DB.prepare(query).bind(...params);
 const escapeHtml = (value) => String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 
-export function coordinates(name) {
+export function coordinates(name, longitudeFirst = false) {
   const decimal = "[+-]?(?:[0-9]+(?:\\.[0-9]+)?|\\.[0-9]+)";
   const match = String(name).match(new RegExp(`^\\s*(${decimal})\\s*,\\s*(${decimal})\\s*$`));
   if (!match) return null;
   const point = match.slice(1).map(Number);
+  if (longitudeFirst) point.reverse();
   return Math.abs(point[0]) <= 90 && Math.abs(point[1]) <= 180 ? point : null;
+}
+
+export function filenameCoordinates(name) {
+  const stem = name.replace(/\.(mp4|mov|webm|mkv|jpe?g|png|gif)$/i, "").replace(/__telegram$/i, "").trim();
+  return coordinates(stem.includes(",") ? stem : stem.replace(/\s+/, ","), true);
 }
 
 export function score(latitude, longitude, targetLatitude, targetLongitude) {
@@ -109,10 +120,10 @@ async function driveToken(env) {
   return googleToken.value;
 }
 
-async function driveFetch(env, path, parameters) {
+async function driveFetch(env, path, parameters, timeout = 55000) {
   const token = await driveToken(env);
   const response = await fetch(`https://www.googleapis.com/drive/v3/files${path}?${new URLSearchParams(parameters)}`, {
-    headers: { Authorization: "Bearer " + token }, signal: AbortSignal.timeout(55000),
+    headers: { Authorization: "Bearer " + token }, signal: AbortSignal.timeout(timeout),
   });
   if (!response.ok) {
     await response.body?.cancel();
@@ -121,49 +132,86 @@ async function driveFetch(env, path, parameters) {
   return response;
 }
 
-async function chooseLocation(env) {
+const folderQuery = (id, filter) => `'${id}' in parents and trashed=false and (${filter})`;
+const driveId = (value) => /^[\w-]+$/.test(value);
+
+function classify(media, prepared) {
+  const size = Number(media.size);
+  if (!media.capabilities?.canDownload || !Number.isSafeInteger(size) || size < 1) return null;
+  const format = mediaTypes[media.mimeType];
+  if (format && size <= format[3]) return { media, format, size };
+  const ready = prepared.get(`${media.id}:${media.version}`);
+  if (ready) return {
+    media: { ...media, mimeType: "video/mp4", videoMediaMetadata: {
+      width: ready.width, height: ready.height, durationMillis: ready.duration * 1000,
+    } },
+    format: mediaTypes["video/mp4"], size: ready.size, objectKey: ready.object_key,
+  };
+  if (convertibleVideo.has(media.mimeType) && media.version && size <= maxSourceBytes) {
+    return { media, size, needsPreparation: true };
+  }
+  return null;
+}
+
+async function scanLocations(env, cursor, limit) {
   const root = env.DRIVE_ROOT || game.drive;
-  const used = new Set((await db(env, "SELECT folder FROM rounds WHERE status<>'failed'").all()).results.map((r) => r.folder));
-  const stored = await db(env, "SELECT value FROM settings WHERE key='drive_cursor'").first("value");
+  if (!driveId(root)) throw new Error("Invalid Drive root");
+  const [usedRows, preparedRows, page] = await Promise.all([
+    db(env, "SELECT folder FROM rounds WHERE status<>'failed'").all(),
+    db(env, "SELECT * FROM prepared_media").all(),
+    driveFetch(env, "", {
+      q: folderQuery(root, `mimeType='${folderMime}' or ${mediaQuery}`), orderBy: "name", pageSize: "50",
+      fields: driveFields, ...(cursor.page ? { pageToken: cursor.page } : {}),
+    }).then((response) => response.json()),
+  ]);
+  const used = new Set(usedRows.results.map((row) => row.folder));
+  const prepared = new Map(preparedRows.results.map((row) => [`${row.file_id}:${row.source_version}`, row]));
+  const files = page.files ?? [];
+  const stop = Math.min(files.length, cursor.offset + limit);
+  const locations = [];
+  for (let i = cursor.offset; i < stop; i++) {
+    const item = files[i];
+    const isFolder = item.mimeType === folderMime;
+    const locationKey = isFolder ? item.id : `file:${item.id}`;
+    const point = isFolder ? coordinates(item.name) : filenameCoordinates(item.name);
+    if (used.has(locationKey) || !point || !driveId(item.id)) continue;
+    let available;
+    if (isFolder) {
+      const inner = await (await driveFetch(env, "", {
+        q: folderQuery(item.id, mediaQuery), fields: driveFields, pageSize: "10",
+      })).json();
+      if (inner.nextPageToken) continue;
+      const candidates = (inner.files ?? []).map((media) => classify(media, prepared)).filter(Boolean);
+      const ready = candidates.filter((item) => !item.needsPreparation);
+      if (ready.length === 1) [available] = ready;
+      else if (!ready.length && candidates.length === 1) [available] = candidates;
+    } else {
+      available = classify(item, prepared);
+    }
+    if (available) locations.push({ ...available, folder: locationKey, point, cursor: { page: cursor.page, offset: i } });
+  }
+  const done = stop === files.length && !page.nextPageToken;
+  const next = stop < files.length ? { page: cursor.page, offset: stop } : { page: page.nextPageToken || "", offset: 0 };
+  return { locations, next, done };
+}
+
+async function chooseLocation(env) {
+  const stored = await db(env, "SELECT value FROM settings WHERE key='drive_cursor_v2'").first("value");
   const cursor = stored ? JSON.parse(stored) : { page: "", offset: 0 };
-  const driveId = (id) => String(id).replace(/[^\w-]/g, "");
-  const query = (id, extra = "") => `'${driveId(id)}' in parents and trashed=false${extra}`;
-  let page;
   try {
-    page = await (await driveFetch(env, "", {
-      q: query(root, ` and mimeType='${folderMime}'`), orderBy: "name", pageSize: "50",
-      fields: "nextPageToken,files(id,name)", ...(cursor.page ? { pageToken: cursor.page } : {}),
-    })).json();
+    const { locations, next, done } = await scanLocations(env, cursor, 12);
+    const ready = locations.find((location) => !location.needsPreparation);
+    if (ready) return ready;
+    await saveCursor(env, next.page, next.offset);
+    return { done };
   } catch (error) {
     if (cursor.page && error instanceof ApiFailure && error.status === 400) await saveCursor(env, "", 0);
     throw error;
   }
-  const { files = [] } = page;
-  // Bound the number of Drive requests per tick. Continue at the next folder on the next tick.
-  const stop = Math.min(files.length, cursor.offset + 12);
-  for (let i = cursor.offset; i < stop; i++) {
-    const folder = files[i];
-    const point = coordinates(folder.name);
-    if (used.has(folder.id) || !point) continue;
-    const response = await driveFetch(env, "", {
-      q: query(folder.id, " and (" + Object.keys(mediaTypes).map((m) => `mimeType='${m}'`).join(" or ") + ")"),
-      fields: "nextPageToken,files(id,mimeType,size,capabilities(canDownload))", pageSize: "2",
-    });
-    const inner = await response.json();
-    const media = inner.files?.[0];
-    if (inner.nextPageToken || inner.files?.length !== 1 || !media.capabilities?.canDownload) continue;
-    const size = Number(media.size);
-    const format = mediaTypes[media.mimeType];
-    if (!format || !Number.isSafeInteger(size) || size < 1 || size > format[3]) continue;
-    return { folder: folder.id, point, media, size, format, cursor: { page: cursor.page, offset: i } };
-  }
-  const done = stop === files.length && !page.nextPageToken;
-  await saveCursor(env, stop < files.length ? cursor.page : page.nextPageToken || "", stop < files.length ? stop : 0);
-  return { done };
 }
 
 function saveCursor(env, page, offset) {
-  return db(env, "INSERT INTO settings VALUES ('drive_cursor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+  return db(env, "INSERT INTO settings VALUES ('drive_cursor_v2',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
     JSON.stringify({ page, offset })).run();
 }
 
@@ -193,7 +241,15 @@ export function multipart(location, round) {
       text: "Сделать предположение", url: `https://t.me/${game.bot}?start=round_${round.id}`,
     }]] }),
   };
-  if (field === "video") fields.supports_streaming = "true";
+  if (field === "video") {
+    fields.supports_streaming = "true";
+    const { width, height, durationMillis } = location.media.videoMediaMetadata ?? {};
+    if (Number.isInteger(width) && width > 0 && Number.isInteger(height) && height > 0) {
+      Object.assign(fields, { width, height });
+    }
+    const duration = Math.round(Number(durationMillis) / 1000);
+    if (Number.isSafeInteger(duration) && duration > 0) fields.duration = duration;
+  }
   const header = encode.encode(Object.entries(fields).map(([name, value]) =>
     `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`).join("") +
     `--${boundary}\r\nContent-Disposition: form-data; name="${field}"; filename="round-${round.id}.${extension}"\r\n` +
@@ -231,7 +287,10 @@ async function publish(env, slot, end) {
   if (saved && saved.status !== "failed") return null;
   const location = await chooseLocation(env);
   if (!location.media) return location.done ? "Пока нет подходящих локаций." : "Поиск продолжается в следующем проходе.";
-  const source = await driveFetch(env, "/" + encodeURIComponent(location.media.id), { alt: "media", supportsAllDrives: "true" });
+  const source = location.objectKey
+    ? await env.MEDIA.get(location.objectKey)
+    : await driveFetch(env, "/" + encodeURIComponent(location.media.id), { alt: "media", supportsAllDrives: "true" });
+  if (!source?.body) throw new Error("Media body is unavailable");
   let round;
   try {
     const now = clock();
@@ -267,35 +326,80 @@ async function publish(env, slot, end) {
   }
 }
 
-async function flush(env, budget = 6) {
+const validUsername = (username) => typeof username === "string" && /^[a-z0-9_]{1,32}$/i.test(username);
+const mention = (user, name, username) => `<a href="tg://user?id=${user}">${validUsername(username) ? "@" + username : escapeHtml((name || "Игрок").slice(0, 80))}</a>`;
+const googleMaps = (latitude, longitude) => `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${latitude},${longitude}`)}`;
+
+export function leaderboard(round, players) {
+  const top = players.map((player) => ({
+    ...player, ...score(player.latitude, player.longitude, round.latitude, round.longitude),
+  })).sort((a, b) => b.points - a.points || a.km - b.km || a.submitted - b.submitted || a.user - b.user).slice(0, 10);
+  const lines = [`Раунд #${round.id} завершён. Участников: ${players.length}.`];
+  if (!top.length) return lines.join("\n");
+  const winner = top[0];
+  lines.push(`🏆 <b>Победитель</b> — ${mention(winner.user, winner.name, winner.username)} · ${winner.points} очков`, "", "<b>Топ‑10</b>");
+  lines.push(...top.map((player, index) =>
+    `${index + 1}. ${mention(player.user, player.name, player.username)} — ${player.points}`));
+  return lines.join("\n");
+}
+
+async function inventory(env) {
+  const { locations, done } = await scanLocations(env, { page: "", offset: 0 }, 22);
+  const videos = locations.filter((location) => convertibleVideo.has(location.media.mimeType));
+  const pending = videos.filter((location) => location.needsPreparation).length;
+  const suffix = done ? "" : "+";
+  return `Остаток видео для новых раундов\nГотовы: ${videos.length - pending}${suffix}\nЖдут обработки: ${pending}${suffix}` +
+    (done ? "" : "\nПоказано минимум по первой части очереди.");
+}
+
+async function delivery(env, item) {
+  const chatId = item.kind === "inventory" ? String(env.ADMIN_IDS || "").split(/[,\s]+/).find(Boolean) : item.chat;
+  if (item.kind === "inventory") {
+    if (!chatId) return null;
+    return { method: "sendMessage", body: { chat_id: chatId, text: await inventory(env) } };
+  }
+  const row = await db(env, `SELECT r.id,r.latitude,r.longitude,g.latitude AS guess_lat,g.longitude AS guess_lon,g.name,g.username
+    FROM rounds r LEFT JOIN guesses g ON g.round=r.id AND g.user=? WHERE r.id=?`, item.user, item.round).first();
+  const maps = googleMaps(row.latitude, row.longitude);
+  if (item.kind === "location") {
+    return { method: "sendLocation", body: {
+      chat_id: chatId, latitude: row.latitude, longitude: row.longitude,
+      reply_markup: { inline_keyboard: [[{ text: "Открыть Google Maps", url: maps }]] },
+    } };
+  }
+
+  let text;
+  if (item.kind === "guess") {
+    text = `${mention(item.user, row.name, row.username)} сделал предположение в раунде #${item.round}`;
+  } else if (item.kind === "reveal") {
+    const players = (await db(env, "SELECT user,name,username,latitude,longitude,submitted FROM guesses WHERE round=?", item.round).all()).results;
+    text = leaderboard(row, players);
+  } else {
+    const { km, points } = score(row.guess_lat, row.guess_lon, row.latitude, row.longitude);
+    await db(env, "UPDATE guesses SET distance=?,points=? WHERE round=? AND user=?", km, points, item.round, item.user).run();
+    text = `Раунд #${item.round} завершён.\nПравильная точка: ${row.latitude}, ${row.longitude}\n` +
+      `Расстояние: ${km.toFixed(2)} км\nОчки: ${points} из 5000\n<a href="${maps.replaceAll("&", "&amp;")}">Открыть Google Maps</a>`;
+  }
+  return { method: "sendMessage", body: { chat_id: chatId, text, parse_mode: "HTML", link_preview_options: { is_disabled: true } } };
+}
+
+async function flush(env, budget = 10) {
   for (let i = 0; i < budget; i++) {
     const item = await db(env, `UPDATE outbox SET status='sending',updated=?
       WHERE id=(SELECT id FROM outbox WHERE status='pending' AND updated<=? ORDER BY id LIMIT 1)
       RETURNING *`, clock(), clock()).first();
     if (!item) return;
-    const row = await db(env, `SELECT r.latitude,r.longitude,g.latitude AS guess_lat,g.longitude AS guess_lon,g.name,
-      (SELECT COUNT(*) FROM guesses WHERE round=r.id) AS participants
-      FROM rounds r LEFT JOIN guesses g ON g.round=r.id AND g.user=? WHERE r.id=?`, item.user, item.round).first();
-    let text;
-    if (item.kind === "guess") {
-      text = `<a href="tg://user?id=${item.user}">${escapeHtml(row.name)}</a> сделал предположение в раунде #${item.round}`;
-    } else {
-      const coords = `${row.latitude}, ${row.longitude}`;
-      const maps = `https://www.google.com/maps/search/?api=1&amp;query=${encodeURIComponent(coords)}`;
-      text = `Раунд #${item.round} завершён.\nПравильная точка: ${coords}\n`;
-      if (item.kind === "reveal") {
-        text += `Участников: ${row.participants}\n`;
-      } else {
-        const { km, points } = score(row.guess_lat, row.guess_lon, row.latitude, row.longitude);
-        await db(env, "UPDATE guesses SET distance=?,points=? WHERE round=? AND user=?", km, points, item.round, item.user).run();
-        text += `Расстояние: ${km.toFixed(2)} км\nОчки: ${points} из 5000\n`;
-      }
-      text += `<a href="${maps}">Открыть Google Maps</a>`;
+    let payload;
+    try {
+      payload = await delivery(env, item);
+    } catch (error) {
+      await db(env, "UPDATE outbox SET status='pending',updated=? WHERE id=?", clock() + 60, item.id).run();
+      logFailure("Prepare notification")(error);
+      continue;
     }
-
     let message;
     try {
-      message = await telegram(env, "sendMessage", { chat_id: item.chat, text, parse_mode: "HTML", link_preview_options: { is_disabled: true } });
+      if (payload) message = await telegram(env, payload.method, payload.body);
     } catch (error) {
       const limited = error instanceof ApiFailure && error.status === 429;
       const rejected = error instanceof ApiFailure && error.status >= 400 && error.status < 500;
@@ -305,7 +409,7 @@ async function flush(env, budget = 6) {
       if (limited) return;
       continue;
     }
-    await db(env, "UPDATE outbox SET status='sent',message_id=?,updated=? WHERE id=?", message.message_id, clock(), item.id).run();
+    await db(env, "UPDATE outbox SET status='sent',message_id=?,updated=? WHERE id=?", message?.message_id ?? null, clock(), item.id).run();
   }
 }
 
@@ -361,6 +465,13 @@ async function admin(env, ctx, message, command, args, updateId) {
         `Публикаций с неизвестным исходом: ${publication}.`,
         ...counts.map(({ status, count }) => `Уведомления (${status}): ${count}.`),
       ].join("\n"));
+    }
+    case "/inventory": {
+      try { return reply(message, await inventory(env)); }
+      catch (error) {
+        logFailure("Video inventory")(error);
+        return reply(message, "Не удалось подсчитать остаток видео. Проверь Google Drive.");
+      }
     }
     case "/sync": {
       try {
@@ -446,10 +557,11 @@ async function webhook(env, ctx, request) {
   if (!selected) return reply(message, "Сначала открой раунд по кнопке в канале.");
   const name = [message.from.first_name, message.from.last_name].filter(Boolean).join(" ");
   const now = clock();
-  const stored = await db(env, `INSERT INTO guesses(round,user,name,latitude,longitude,announcement,submitted)
-    SELECT id,?,?,?,?,?,? FROM rounds WHERE id=? AND status='active' AND ends>?
+  const stored = await db(env, `INSERT INTO guesses(round,user,name,latitude,longitude,announcement,submitted,username)
+    SELECT id,?,?,?,?,?,?,? FROM rounds WHERE id=? AND status='active' AND ends>?
     ON CONFLICT(round,user) DO NOTHING RETURNING round`,
-  user, name, point.latitude, point.longitude, announcementChat(env), now, selected, now).first();
+  user, name, point.latitude, point.longitude, announcementChat(env), now,
+    validUsername(message.from.username) ? message.from.username : null, selected, now).first();
   if (!stored) {
     const active = await db(env, "SELECT 1 FROM rounds WHERE id=? AND status='active' AND ends>?", selected, now).first();
     return reply(message, active ? duplicate : expired);
@@ -484,6 +596,70 @@ async function mcp(env, request) {
   return Response.json({ jsonrpc: "2.0", id: rpc.id, error: { code: -32601, message: "Method not found" } });
 }
 
+async function mediaMetadata(env, id, version) {
+  const root = env.DRIVE_ROOT || game.drive;
+  const get = async (fileId, fields) => {
+    try {
+      return await (await driveFetch(env, "/" + encodeURIComponent(fileId), { fields, supportsAllDrives: "true" })).json();
+    } catch (error) {
+      if (error instanceof ApiFailure && error.status === 404) return null;
+      throw error;
+    }
+  };
+  const media = await get(id, "id,name,mimeType,size,version,parents,trashed,capabilities(canDownload)");
+  if (!media || media.trashed || media.version !== version || !classify(media, new Map())?.needsPreparation) return null;
+  if (media.parents?.includes(root)) return filenameCoordinates(media.name) ? media : null;
+  const folderId = media.parents?.[0];
+  if (!folderId || !driveId(folderId)) return null;
+  const folder = await get(folderId, "name,mimeType,parents,trashed");
+  return folder && !folder.trashed && folder.mimeType === folderMime && folder.parents?.includes(root) && coordinates(folder.name)
+    ? media : null;
+}
+
+async function mediaAPI(request, env) {
+  if (!env.MEDIA_PREPARER_KEY || request.headers.get("X-ITMOGUESSR-Media-Key") !== env.MEDIA_PREPARER_KEY) {
+    return new Response("Forbidden", { status: 403 });
+  }
+  const url = new URL(request.url);
+  if (request.method === "GET" && url.pathname === "/media/queue") {
+    const page = url.searchParams.get("page") || "";
+    const offset = Number(url.searchParams.get("offset") || 0);
+    if (!Number.isInteger(offset) || offset < 0 || offset > 50 || page.length > 2000) return new Response("Bad cursor", { status: 400 });
+    const { locations, next, done } = await scanLocations(env, { page, offset }, 12);
+    const items = locations.filter((item) => item.needsPreparation)
+      .map(({ media }) => ({ id: media.id, version: media.version }));
+    return Response.json({ items, next: done ? null : next });
+  }
+  if (request.method === "POST" && url.pathname === "/media/wake") {
+    await tick(env);
+    return okay();
+  }
+  const match = url.pathname.match(/^\/media\/([\w-]+)\/(\d+)$/);
+  if (!match || !["GET", "PUT"].includes(request.method)) return new Response("Not found", { status: 404 });
+  const [, id, version] = match;
+  const media = await mediaMetadata(env, id, version);
+  if (!media) return new Response("Not found", { status: 404 });
+  if (request.method === "GET") {
+    const response = await driveFetch(env, "/" + id, { alt: "media", supportsAllDrives: "true" }, 600000);
+    return new Response(response.body, { headers: { "Content-Type": "application/octet-stream", "Cache-Control": "no-store" } });
+  }
+  const size = Number(request.headers.get("Content-Length"));
+  const width = Number(request.headers.get("X-Media-Width"));
+  const height = Number(request.headers.get("X-Media-Height"));
+  const duration = Number(request.headers.get("X-Media-Duration"));
+  if (!request.body || ![size, width, height, duration].every((n) => Number.isSafeInteger(n) && n > 0) ||
+      size > mediaTypes["video/mp4"][3] || width > 1920 || height > 1080) {
+    return new Response("Bad media", { status: 400 });
+  }
+  const base = media.name.replace(/\.[^.]+$/, "").replace(/[\/\\]/g, "_").slice(0, 160);
+  const key = `prepared/${id}/${version}/${base}__telegram.mp4`;
+  await env.MEDIA.put(key, request.body, { httpMetadata: { contentType: "video/mp4" } });
+  await db(env, `INSERT INTO prepared_media VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(file_id,source_version) DO UPDATE SET
+    object_key=excluded.object_key,size=excluded.size,width=excluded.width,height=excluded.height,duration=excluded.duration,updated=excluded.updated`,
+  id, version, key, size, width, height, duration, clock()).run();
+  return okay();
+}
+
 export default {
   async fetch(request, env, ctx) {
     const path = new URL(request.url).pathname;
@@ -493,6 +669,13 @@ export default {
     }
     if (request.method === "POST" && path === "/telegram") return webhook(env, ctx, request);
     if (request.method === "POST" && path === "/mcp") return mcp(env, request);
+    if (path.startsWith("/media/")) {
+      try { return await mediaAPI(request, env); }
+      catch (error) {
+        logFailure("Media preparation")(error);
+        return new Response("Preparation service unavailable", { status: 503 });
+      }
+    }
     return new Response("Not found", { status: 404 });
   },
   scheduled(_event, env, ctx) {

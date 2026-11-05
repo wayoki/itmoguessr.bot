@@ -1,0 +1,33 @@
+name: Prepare Telegram videos
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: itmoguessr-media
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check FFmpeg
+        run: |
+          if ! command -v ffmpeg >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends ffmpeg
+          fi
+      - name: Prepare private Drive media
+        env:
+          ITMOGUESSR_MEDIA_ORIGIN: https://itmoguessr-training-bot.handydandelion1.chatgpt.site
+          ITMOGUESSR_MEDIA_KEY: ${{ secrets.ITMOGUESSR_MEDIA_KEY }}
+        run: python3 worker/scripts/cloud_prepare.py
