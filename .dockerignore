@@ -1,0 +1,9 @@
+**
+!Dockerfile
+!requirements.txt
+!bot/
+!bot/*.py
+!config/
+!config/settings.yaml
+!tests/
+!tests/*.py

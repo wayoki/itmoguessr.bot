@@ -1,0 +1,48 @@
+timezone: Europe/Moscow
+attempts_per_round: 1 # Инвариант MVP, проверяется также в SQLite.
+
+telegram:
+  channel: "@swidfkjew"
+  announcement_channel: "@swidfkjew"
+
+drive:
+  root_folder_id: "1rlP26NNEgdsHkv1n1QGo9SAkaT6aCady"
+  selection: sequential # sequential: имя файла, затем ID папки; или random
+
+schedule:
+  enabled: true
+  check_interval_seconds: 10
+  publication_retry_seconds: 300
+  manual_duration_minutes: 120
+  rounds:
+    - id: morning
+      publish: "10:00"
+      reveal: "19:00"
+    - id: evening
+      publish: "20:00"
+      reveal: "09:00"
+
+text:
+  round_caption: |-
+    Раунд #{round_id}
+    Куда нас занесло? Приём ответов до {closes_at}.
+  guess_button: Сделать предположение
+  round_prompt: 'Раунд #{round_id}. Открой «Вложения → Геопозиция», выбери точку на карте и отправь её сюда.'
+  welcome: Открой публикацию раунда в канале и нажми «Сделать предположение».
+  round_closed: Приём ответов в этом раунде закрыт.
+  guess_duplicate: Ты уже использовал попытку в этом раунде.
+  guess_accepted: Твоё предположение принято! Результаты появятся после завершения раунда
+  guess_no_round: Сначала открой раунд кнопкой «Сделать предположение» в канале.
+  guess_live: Отправь выбранную точку на карте как обычную геопозицию.
+  guess_channel: '{mention} сделал предположение в раунде #{round_id}'
+  result_private: |-
+    Раунд #{round_id} завершён.
+    Правильная точка: {latitude}, {longitude}
+    Расстояние: {distance_km} км
+    Очки: {points} из 5000
+    <a href="{maps_url}">Открыть Google Maps</a>
+  reveal_channel: |-
+    Раунд #{round_id} завершён.
+    Правильная точка: {latitude}, {longitude}
+    Участников: {participants}
+    <a href="{maps_url}">Открыть Google Maps</a>

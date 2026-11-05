@@ -1,0 +1,28 @@
+services:
+  bot:
+    build: .
+    init: true
+    restart: unless-stopped
+    user: "${BOT_UID:-1000}:${BOT_GID:-1000}"
+    env_file: .env
+    environment:
+      SETTINGS_PATH: /app/config/settings.yaml
+      DB_PATH: /data/bot.sqlite3
+    volumes:
+      - type: bind
+        source: ./data
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets
+        target: /run/itmoguessr
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./config/settings.yaml
+        target: /app/config/settings.yaml
+        read_only: true
+        bind:
+          create_host_path: false
