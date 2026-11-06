@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
-import worker, { activeSlots, coordinates, filenameCoordinates, leaderboard, multipart, score } from "../index.js";
+import worker, { activeSlots, coordinates, filenameCoordinates, leaderboard, multipart, resolveFilenameCoordinates, score } from "../index.js";
 
 function database() {
   const sql = new DatabaseSync(":memory:");
@@ -244,4 +244,42 @@ test("preparer routes require their own secret", async () => {
     assert.equal(response.status, 403);
   }
   sql.close();
+});
+
+test("Maps links use pin or panorama coordinates and ignore the map center", () => {
+  const point = [56.62567, 23.34348];
+  for (const name of [
+    "https://www.google.com/maps/search/?api=1&query=56.62567%2C23.34348.mp4",
+    "https://www.google.com/maps/place/Location/@56.9,23.1,14z/data=!8m2!3d56.62567!4d23.34348!16sfoo.mov",
+    "https://www.google.com/maps/@56.62567,23.34348,3a,75y/data=!3m7!1e1!3m5!1s-panorama.mov",
+    "https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=56.62567%2C23.34348.mov",
+  ]) assert.deepEqual(filenameCoordinates(name), point);
+  for (const name of [
+    "https://www.google.com/maps/@56.62567,23.34348,14z.mov",
+    "https://www.google.com/maps/@?api=1&map_action=map&center=56.62567,23.34348.mov",
+    "https://www.google.com/maps/dir/?api=1&query=56.62567,23.34348.mov",
+    "https://www.google.com/maps/place/Location/data=!3d56.62!4d23.34!3d56.63!4d23.35.mov",
+    "https://fake.example/maps/search/?query=56.62567,23.34348.mov",
+  ]) assert.equal(filenameCoordinates(name), null);
+});
+
+test("short Maps links resolve once and never follow a redirect to another service", async (t) => {
+  let requests = 0;
+  t.mock.method(globalThis, "fetch", async (url, { redirect }) => {
+    requests += 1;
+    assert.equal(redirect, "manual");
+    if (url.endsWith("/PinCase123")) {
+      return new Response(null, { status: 302, headers: {
+        Location: "https://www.google.com/maps/place/Pin/@56.8,23.5,8z/data=!3d56.62567!4d23.34348",
+      } });
+    }
+    assert.ok(url.endsWith("/BlockedCase123"));
+    return new Response(null, { status: 302, headers: {
+      Location: "https://fake.example/maps/?query=56.62567,23.34348",
+    } });
+  });
+  assert.deepEqual(await resolveFilenameCoordinates("maps_PinCase123.mov"), [56.62567, 23.34348]);
+  assert.deepEqual(await resolveFilenameCoordinates("https://maps.app.goo.gl/PinCase123.mp4"), [56.62567, 23.34348]);
+  assert.equal(await resolveFilenameCoordinates("https://maps.app.goo.gl/BlockedCase123.mp4"), null);
+  assert.equal(requests, 2);
 });
