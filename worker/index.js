@@ -418,10 +418,12 @@ async function flush(env, budget = 10) {
   }
 }
 
-async function tick(env) {
+async function tick(env, source) {
   const now = clock();
+  const recordTick = (key) => db(env, "INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", key, String(now));
   await env.DB.batch([
-    db(env, "INSERT INTO settings VALUES('last_tick',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", String(now)),
+    recordTick("last_tick"),
+    ...(source === "apps_script" ? [recordTick("last_apps_script_tick")] : []),
     db(env, "UPDATE rounds SET status='uncertain' WHERE status='publishing' AND updated<?", now - 180),
     db(env, "UPDATE outbox SET status='uncertain' WHERE status='sending' AND updated<?", now - 180),
     db(env, "UPDATE rounds SET status='closed',updated=? WHERE status='active' AND ends<=?", now, now),
@@ -465,6 +467,7 @@ async function admin(env, ctx, message, command, args, updateId) {
       const paused = await db(env, "SELECT value FROM settings WHERE key='paused'").first("value");
       const publication = await db(env, "SELECT COUNT(*) AS n FROM rounds WHERE status='uncertain'").first("n");
       const lastTick = await db(env, "SELECT value FROM settings WHERE key='last_tick'").first("value");
+      const googleTick = await db(env, "SELECT value FROM settings WHERE key='last_apps_script_tick'").first("value");
       const lastClosed = await db(env, `SELECT r.id,
         (SELECT message_id FROM outbox WHERE round=r.id AND kind='reveal' AND status='sent') AS reveal_message,
         (SELECT COUNT(*) FROM guesses WHERE round=r.id) AS players,
@@ -473,6 +476,7 @@ async function admin(env, ctx, message, command, args, updateId) {
       return reply(message, [
         `Расписание: ${env.SCHEDULE_ENABLED !== "true" ? "выключено" : paused === "1" ? "на паузе" : "включено"}.`,
         ...(lastTick ? [`Последняя проверка расписания — ${timeLabel.format(Number(lastTick) * 1000)} МСК.`] : []),
+        ...(googleTick ? [`Последняя проверка из Google — ${timeLabel.format(Number(googleTick) * 1000)} МСК.`] : []),
         ...active.map((round) => round.ends <= now
           ? `Раунд #${round.id} ждёт раскрытия.`
           : `Раунд #${round.id} до ${timeLabel.format(round.ends * 1000)} МСК (сообщение #${round.message_id}).`),
@@ -700,6 +704,24 @@ async function mediaAPI(request, env) {
   return okay();
 }
 
+async function appsScriptSchedule(request, env) {
+  const expected = env.APPS_SCRIPT_SCHEDULE_DIGEST;
+  if (!/^[a-f0-9]{64}$/.test(expected ?? "") || request.headers.get("Content-Length") !== "64") {
+    return new Response("Forbidden", { status: 403 });
+  }
+  const key = await request.text();
+  if (!/^[a-f0-9]{64}$/.test(key)) return new Response("Forbidden", { status: 403 });
+  const bytes = new Uint8Array(await crypto.subtle.digest("SHA-256", encode.encode(key)));
+  const actual = [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  let mismatch = 0;
+  for (let index = 0; index < actual.length; index++) {
+    mismatch |= actual.charCodeAt(index) ^ expected.charCodeAt(index);
+  }
+  if (mismatch) return new Response("Forbidden", { status: 403 });
+  await tick(env, "apps_script");
+  return okay();
+}
+
 export default {
   async fetch(request, env, ctx) {
     const path = new URL(request.url).pathname;
@@ -709,6 +731,13 @@ export default {
     }
     if (request.method === "POST" && path === "/telegram") return webhook(env, ctx, request);
     if (request.method === "POST" && path === "/mcp") return mcp(env, request);
+    if (request.method === "POST" && path === "/schedule/check") {
+      try { return await appsScriptSchedule(request, env); }
+      catch (error) {
+        logFailure("Apps Script schedule")(error);
+        return new Response("Schedule unavailable", { status: 503 });
+      }
+    }
     if (path.startsWith("/media/")) {
       try { return await mediaAPI(request, env); }
       catch (error) {

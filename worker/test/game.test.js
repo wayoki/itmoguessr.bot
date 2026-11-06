@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
@@ -269,5 +270,21 @@ test("preparer routes require their own secret", async () => {
       { headers: { "X-ITMOGUESSR-Media-Key": "telegram-only" } }), env, {});
     assert.equal(response.status, 403);
   }
+  sql.close();
+});
+
+test("Google schedule key is accepted only on the scheduling route", async () => {
+  const { DB, sql } = database();
+  const key = "a".repeat(64);
+  const env = { DB, APPS_SCRIPT_SCHEDULE_DIGEST: createHash("sha256").update(key).digest("hex") };
+  const post = (path, body) => worker.fetch(new Request("https://bot.example" + path, {
+    method: "POST", body, headers: { "Content-Length": String(body.length), "X-ITMOGUESSR-Media-Key": body },
+  }), env, {});
+  assert.equal((await post("/schedule/check", "b".repeat(64))).status, 403);
+  assert.equal((await post("/schedule/check", env.APPS_SCRIPT_SCHEDULE_DIGEST)).status, 403);
+  assert.equal((await post("/media/wake", key)).status, 403);
+  assert.equal((await post("/telegram", key)).status, 403);
+  assert.equal((await post("/schedule/check", key)).status, 200);
+  assert.ok(sql.prepare("SELECT value FROM settings WHERE key='last_apps_script_tick'").get().value);
   sql.close();
 });
