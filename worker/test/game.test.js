@@ -6,7 +6,7 @@ import worker, { activeSlots, coordinates, filenameCoordinates, leaderboard, mul
 
 function database() {
   const sql = new DatabaseSync(":memory:");
-  for (const name of ["0000_game.sql", "0001_reveal_and_prepared_media.sql"]) {
+  for (const name of ["0000_game.sql", "0001_reveal_and_prepared_media.sql", "0002_round_corrections.sql"]) {
     sql.exec(readFileSync(new URL("../drizzle/" + name, import.meta.url), "utf8"));
   }
   const DB = {
@@ -44,9 +44,10 @@ test("coordinates and World scoring", () => {
   for (const name of ["hello", "91, 0", "0, 181", "Infinity, 0", "2, 3, 4"]) {
     assert.equal(coordinates(name), null);
   }
-  assert.deepEqual(filenameCoordinates("135.7681, 35.0116.MP4"), [35.0116, 135.7681]);
-  assert.deepEqual(filenameCoordinates("-123.5 48.6__telegram.mp4"), [48.6, -123.5]);
-  assert.equal(filenameCoordinates("35.0116, 135.7681.mp4"), null);
+  assert.deepEqual(filenameCoordinates("35.0116, 135.7681.MP4"), [35.0116, 135.7681]);
+  assert.deepEqual(filenameCoordinates("48.6 -123.5__telegram.mp4"), [48.6, -123.5]);
+  assert.equal(filenameCoordinates("135.7681, 35.0116.mp4"), null);
+  assert.deepEqual(filenameCoordinates("56.62567, 23.34348.mov"), [56.62567, 23.34348]);
   assert.deepEqual(score(0, 0, 0, 0), { km: 0, points: 5000 });
   assert.equal(score(0, 0, 0, 180).points, 0);
   assert.ok(Math.abs(score(0, 0, 0, 1).km - 111.195) < 0.001);
@@ -122,6 +123,18 @@ test("webhook enforces secret and accepts a single guess, then reveals once", as
   assert.equal(sent.length, 4);
   assert.match((await (await tg(point)).json()).text, /приём ответов.*закрыт/i);
   assert.equal(sql.prepare("SELECT points FROM guesses").get().points, 5000);
+  assert.match((await (await tg({ text: "/correct 1 56.62567, 23.34348" }, 43)).json()).text, /администраторам/);
+  assert.match((await (await tg({ text: "/correct 1 56.62567, 23.34348" })).json()).text, /исправлена/);
+  await Promise.all(tasks.splice(0));
+  const corrections = sent.slice(4);
+  assert.equal(corrections.length, 3);
+  assert.equal(corrections[0].latitude, 56.62567);
+  assert.equal(corrections[0].longitude, 23.34348);
+  assert.ok(corrections.slice(1).every(({ text }) => text.includes("Исправление раунда #1")));
+  assert.notEqual(sql.prepare("SELECT points FROM guesses").get().points, 5000);
+  assert.match((await (await tg({ text: "/correct 1 56.62567, 23.34348" })).json()).text, /уже сохранены/);
+  await Promise.all(tasks.splice(0));
+  assert.equal(sent.length, 7);
   sql.close();
 });
 
