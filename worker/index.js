@@ -43,96 +43,9 @@ export function coordinates(name) {
   return Math.abs(point[0]) <= 90 && Math.abs(point[1]) <= 180 ? point : null;
 }
 
-const mapsHosts = new Set(["google.com", "www.google.com", "maps.google.com", "google.ru", "www.google.ru"]);
-const shortHosts = new Set(["maps.app.goo.gl", "goo.gl"]);
-const mapsPoints = new Map();
-
-function mapUrl(value) {
-  const alias = value.match(/^(?:maps_|maps\.app\.goo\.gl_)([a-z0-9_-]{5,64})$/i);
-  if (alias) value = "https://maps.app.goo.gl/" + alias[1];
-  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) value = "https://" + value;
-  try {
-    const url = new URL(value);
-    return url.protocol === "https:" && !url.username && !url.password && !url.port ? url : null;
-  } catch {
-    return null;
-  }
-}
-
-export function mapsCoordinates(url) {
-  if (!url || !mapsHosts.has(url.hostname)) return null;
-  if (url.hostname !== "maps.google.com" && !/^\/maps(?:\/|$)/.test(url.pathname)) return null;
-  if (/^\/maps\/dir(?:\/|$)/.test(url.pathname) || url.searchParams.has("saddr") || url.searchParams.has("daddr")) {
-    return null;
-  }
-  const explicit = [];
-  for (const key of ["query", "q"]) {
-    for (const value of url.searchParams.getAll(key)) explicit.push(coordinates(value.replace(/^loc:/i, "")));
-  }
-  if (url.searchParams.get("map_action") === "pano") {
-    explicit.push(coordinates(url.searchParams.get("viewpoint") ?? ""));
-  }
-  try {
-    const pathname = decodeURIComponent(url.pathname);
-    const place = pathname.match(/^\/maps\/place\/([^/]+)(?:\/|$)/)?.[1];
-    if (place) explicit.push(coordinates(place));
-    for (const [, lat, lon] of pathname.matchAll(/!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)(?=!|\/|$)/g)) {
-      explicit.push(coordinates(lat + "," + lon));
-    }
-    if (!explicit.some(Boolean) && pathname.includes("!1e1!") && pathname.includes("!1s")) {
-      const panorama = pathname.match(/^\/maps\/@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?),3a(?:,|\/|$)/);
-      if (panorama) explicit.push(coordinates(panorama[1] + "," + panorama[2]));
-    }
-  } catch {
-    return null;
-  }
-  const points = explicit.filter(Boolean);
-  return points.length && points.every(([lat, lon]) => lat === points[0][0] && lon === points[0][1]) ? points[0] : null;
-}
-
-function mediaStem(name) {
-  return name.replace(/\.(mp4|mov|webm|mkv|jpe?g|png|gif)$/i, "").replace(/__telegram$/i, "").trim();
-}
-
 export function filenameCoordinates(name) {
-  const stem = mediaStem(name);
-  return coordinates(stem.includes(",") ? stem : stem.replace(/\s+/, ",")) ?? mapsCoordinates(mapUrl(stem));
-}
-
-export async function resolveFilenameCoordinates(name) {
-  const direct = filenameCoordinates(name);
-  if (direct) return direct;
-  let url = mapUrl(mediaStem(name));
-  if (!url || !shortHosts.has(url.hostname)) return null;
-  const cacheKey = url.origin + url.pathname;
-  const known = mapsPoints.get(cacheKey);
-  if (known) return known;
-  try {
-    for (let hop = 0; hop < 2; hop++) {
-      const path = url.hostname === "goo.gl" ? /^\/maps\/[a-z0-9_-]{5,64}\/?$/i : /^\/[a-z0-9_-]{5,64}\/?$/i;
-      if (!path.test(url.pathname)) return null;
-      const response = await fetch(url.origin + url.pathname, {
-        redirect: "manual", signal: AbortSignal.timeout(4000),
-        headers: { "User-Agent": "ITMOGUESSR-Maps-Link/1.0" },
-      });
-      const location = response.headers.get("Location");
-      await response.body?.cancel();
-      if (response.status < 300 || response.status >= 400 || !location) return null;
-      const target = mapUrl(new URL(location, url).href);
-      if (!target) return null;
-      const point = mapsCoordinates(target);
-      if (point) {
-        if (mapsPoints.size >= 128) mapsPoints.delete(mapsPoints.keys().next().value);
-        mapsPoints.set(cacheKey, point);
-        return point;
-      }
-      if (!shortHosts.has(target.hostname)) return null;
-      url = target;
-    }
-  } catch {
-    return null;
-  }
-  return null;
+  const stem = name.replace(/\.(mp4|mov|webm|mkv|jpe?g|png|gif)$/i, "").replace(/__telegram$/i, "").trim();
+  return coordinates(stem.includes(",") ? stem : stem.replace(/\s+/, ","));
 }
 
 export function score(latitude, longitude, targetLatitude, targetLongitude) {
@@ -259,7 +172,7 @@ async function scanLocations(env, cursor, limit) {
     const item = files[i];
     const isFolder = item.mimeType === folderMime;
     const locationKey = isFolder ? item.id : `file:${item.id}`;
-    const point = isFolder ? coordinates(item.name) : await resolveFilenameCoordinates(item.name);
+    const point = isFolder ? coordinates(item.name) : filenameCoordinates(item.name);
     if (used.has(locationKey) || !point || !driveId(item.id)) continue;
     let available;
     if (isFolder) {
@@ -717,7 +630,7 @@ async function mediaMetadata(env, id, version) {
   };
   const media = await get(id, "id,name,mimeType,size,version,parents,trashed,capabilities(canDownload)");
   if (!media || media.trashed || media.version !== version || !classify(media, new Map())?.needsPreparation) return null;
-  if (media.parents?.includes(root)) return await resolveFilenameCoordinates(media.name) ? media : null;
+  if (media.parents?.includes(root)) return filenameCoordinates(media.name) ? media : null;
   const folderId = media.parents?.[0];
   if (!folderId || !driveId(folderId)) return null;
   const folder = await get(folderId, "name,mimeType,parents,trashed");
