@@ -88,7 +88,7 @@ test("webhook enforces secret and accepts a single guess, then reveals once", as
     method: "POST", headers, body: JSON.stringify(data),
   }), env, ctx);
   const tg = (data, user = 42, secret = "secret") => request("/telegram", { "X-Telegram-Bot-Api-Secret-Token": secret }, {
-    update_id: 10, message: { from: { id: user, first_name: "<Игрок>" }, chat: { type: "private", id: user }, ...data },
+    update_id: 10, message: { from: { id: user, first_name: "<Игрок>", username: "test_player" }, chat: { type: "private", id: user }, ...data },
   });
   const now = Math.floor(Date.now() / 1000);
   sql.prepare("INSERT INTO rounds VALUES(1,'test','drive-folder',48.8566,2.3522,'@swidfkjew',?,55,'active',?)").run(now + 3600, now);
@@ -99,11 +99,14 @@ test("webhook enforces secret and accepts a single guess, then reveals once", as
   const replies = await Promise.all(results.map((result) => result.json()));
   assert.equal(replies.filter(({ text }) => text.includes("принято")).length, 1);
   assert.equal(replies.filter(({ text }) => text.includes("использовал")).length, 1);
+  const accepted = replies.find(({ text }) => text.includes("принято"));
+  assert.match(accepted.text, /Очки: 5000 из 5000/);
+  assert.doesNotMatch(accepted.text, /48\.8566|2\.3522|maps/);
   await Promise.all(tasks.splice(0));
   assert.equal(sent.length, 1);
   assert.match(sent[0].text, /tg:\/\/user\?id=42/);
   assert.match(sent[0].text, /&lt;Игрок&gt;/);
-  assert.ok(!sent[0].text.includes("48.8566"));
+  assert.doesNotMatch(sent[0].text, /48\.8566|5000|test_player/);
 
   assert.match((await (await tg({ text: "/close 1" }, 43)).json()).text, /администраторам/);
   assert.match((await (await tg({ text: "/close 1" })).json()).text, /закрыт/);
@@ -211,16 +214,39 @@ test("manual MP4 round streams a private Drive file into Telegram once", async (
   sql.close();
 });
 
-test("leaderboard keeps ten players, highlights username and resolves equal scores by distance", () => {
+test("leaderboard keeps ten players, links the display name and resolves equal scores by distance", () => {
   const players = Array.from({ length: 12 }, (_, i) => ({
     user: i + 1, username: i === 0 ? "first_player" : null, name: "<player>", latitude: i / 1e6,
     longitude: 0, submitted: 10 - i,
   })).reverse();
   const text = leaderboard({ id: 5, latitude: 0, longitude: 0 }, players);
-  assert.match(text, /🏆 .*@first_player/);
+  assert.match(text, /🏆 .*tg:\/\/user\?id=1">&lt;player&gt;<\/a>/);
+  assert.ok(!text.includes("first_player"));
   assert.match(text, /Участников: 12/);
   assert.equal(text.split("\n").filter((line) => /^\d+\./.test(line)).length, 10);
   assert.ok(!text.includes("<player>"));
+});
+
+test("authenticated schedule wake reveals an expired round exactly once", async (t) => {
+  const { sql, DB } = database();
+  const sent = [];
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    sent.push({ method: url.split("/").at(-1), ...JSON.parse(options.body) });
+    return Response.json({ ok: true, result: { message_id: sent.length } });
+  });
+  const now = Math.floor(Date.now() / 1000);
+  sql.prepare("INSERT INTO rounds VALUES(1,'morning:test','drive-folder',48,2,'@swidfkjew',?,55,'active',?)").run(now - 1, now - 3600);
+  const env = { DB, BOT_TOKEN: "test-token", MEDIA_PREPARER_KEY: "media-secret" };
+  const wake = () => worker.fetch(new Request("https://bot.example/media/wake", {
+    method: "POST", headers: { "X-ITMOGUESSR-Media-Key": "media-secret" },
+  }), env, {});
+  assert.equal((await wake()).status, 200);
+  assert.equal((await wake()).status, 200);
+  assert.deepEqual(sent.map(({ method }) => method), ["sendLocation", "sendMessage"]);
+  assert.match(sent[1].text, /Раунд #1 завершён/);
+  assert.equal(sql.prepare("SELECT status FROM rounds").get().status, "closed");
+  assert.ok(Number(sql.prepare("SELECT value FROM settings WHERE key='last_tick'").get().value) >= now);
+  sql.close();
 });
 
 test("migration preserves the old round and sent notifications", () => {

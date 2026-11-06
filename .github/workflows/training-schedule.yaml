@@ -1,0 +1,27 @@
+name: Check training schedule
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 09:00, 10:00, 19:00 and 20:00 Moscow time. Retry later in each hour.
+    - cron: '1,6,16,31,46 6,7,16,17 * * *'
+
+permissions: {}
+
+concurrency:
+  group: itmoguessr-training-schedule
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Close and publish due rounds
+        env:
+          ITMOGUESSR_MEDIA_KEY: ${{ secrets.ITMOGUESSR_MEDIA_KEY }}
+        run: |
+          curl --fail --silent --show-error --max-time 75 --retry 2 --retry-max-time 90 \
+            --user-agent 'ITMOGUESSR-Schedule/1.0' \
+            --header "X-ITMOGUESSR-Media-Key: ${ITMOGUESSR_MEDIA_KEY}" \
+            --data '' https://itmoguessr-training-bot.handydandelion1.chatgpt.site/media/wake

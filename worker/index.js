@@ -326,7 +326,10 @@ async function publish(env, slot, end) {
 }
 
 const validUsername = (username) => typeof username === "string" && /^[a-z0-9_]{1,32}$/i.test(username);
-const mention = (user, name, username) => `<a href="tg://user?id=${user}">${validUsername(username) ? "@" + username : escapeHtml((name || "Игрок").slice(0, 80))}</a>`;
+const mention = (user, name, username) => {
+  const label = name?.trim() || (validUsername(username) ? "@" + username : "Игрок");
+  return `<a href="tg://user?id=${user}">${escapeHtml(label.slice(0, 80))}</a>`;
+};
 const googleMaps = (latitude, longitude) => `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${latitude},${longitude}`)}`;
 
 export function leaderboard(round, players) {
@@ -418,6 +421,7 @@ async function flush(env, budget = 10) {
 async function tick(env) {
   const now = clock();
   await env.DB.batch([
+    db(env, "INSERT INTO settings VALUES('last_tick',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", String(now)),
     db(env, "UPDATE rounds SET status='uncertain' WHERE status='publishing' AND updated<?", now - 180),
     db(env, "UPDATE outbox SET status='uncertain' WHERE status='sending' AND updated<?", now - 180),
     db(env, "UPDATE rounds SET status='closed',updated=? WHERE status='active' AND ends<=?", now, now),
@@ -456,14 +460,25 @@ async function admin(env, ctx, message, command, args, updateId) {
   switch (command) {
     case "/status": {
       const now = clock();
-      const active = (await db(env, "SELECT id,ends FROM rounds WHERE status='active' AND ends>? ORDER BY ends", now).all()).results;
+      const active = (await db(env, "SELECT id,ends,message_id FROM rounds WHERE status='active' ORDER BY ends").all()).results;
       const counts = (await db(env, "SELECT status,COUNT(*) AS count FROM outbox WHERE status<>'sent' GROUP BY status").all()).results;
       const paused = await db(env, "SELECT value FROM settings WHERE key='paused'").first("value");
       const publication = await db(env, "SELECT COUNT(*) AS n FROM rounds WHERE status='uncertain'").first("n");
+      const lastTick = await db(env, "SELECT value FROM settings WHERE key='last_tick'").first("value");
+      const lastClosed = await db(env, `SELECT r.id,
+        (SELECT message_id FROM outbox WHERE round=r.id AND kind='reveal' AND status='sent') AS reveal_message,
+        (SELECT COUNT(*) FROM guesses WHERE round=r.id) AS players,
+        (SELECT COUNT(*) FROM outbox WHERE round=r.id AND kind='result' AND status='sent') AS delivered
+        FROM rounds r WHERE r.status='closed' ORDER BY r.ends DESC, r.id DESC LIMIT 1`).first();
       return reply(message, [
         `Расписание: ${env.SCHEDULE_ENABLED !== "true" ? "выключено" : paused === "1" ? "на паузе" : "включено"}.`,
-        ...active.map((round) => `Раунд #${round.id} до ${timeLabel.format(round.ends * 1000)} МСК.`),
-        ...(!active.length ? ["Активных раундов нет."] : []),
+        ...(lastTick ? [`Последняя проверка расписания — ${timeLabel.format(Number(lastTick) * 1000)} МСК.`] : []),
+        ...active.map((round) => round.ends <= now
+          ? `Раунд #${round.id} ждёт раскрытия.`
+          : `Раунд #${round.id} до ${timeLabel.format(round.ends * 1000)} МСК (сообщение #${round.message_id}).`),
+        ...(!active.some((round) => round.ends > now) ? ["Активных раундов нет."] : []),
+        ...(lastClosed ? [`Последний закрытый раунд #${lastClosed.id}. Таблица: ${lastClosed.reveal_message
+          ? `сообщение #${lastClosed.reveal_message}` : "отправка не подтверждена"}. Личные результаты: ${lastClosed.delivered}/${lastClosed.players}.`] : []),
         `Публикаций с неизвестным исходом: ${publication}.`,
         ...counts.map(({ status, count }) => `Уведомления (${status}): ${count}.`),
       ].join("\n"));
@@ -581,7 +596,9 @@ async function webhook(env, ctx, request) {
   const now = clock();
   const stored = await db(env, `INSERT INTO guesses(round,user,name,latitude,longitude,announcement,submitted,username)
     SELECT id,?,?,?,?,?,?,? FROM rounds WHERE id=? AND status='active' AND ends>?
-    ON CONFLICT(round,user) DO NOTHING RETURNING round`,
+    ON CONFLICT(round,user) DO NOTHING RETURNING
+      (SELECT latitude FROM rounds WHERE id=guesses.round) AS target_latitude,
+      (SELECT longitude FROM rounds WHERE id=guesses.round) AS target_longitude`,
   user, name, point.latitude, point.longitude, announcementChat(env), now,
     validUsername(message.from.username) ? message.from.username : null, selected, now).first();
   if (!stored) {
@@ -589,7 +606,8 @@ async function webhook(env, ctx, request) {
     return reply(message, active ? duplicate : expired);
   }
   ctx.waitUntil(flush(env, 1).catch(logFailure("Guess notice")));
-  return reply(message, "Твоё предположение принято! Результаты появятся после завершения раунда");
+  const { points } = score(point.latitude, point.longitude, stored.target_latitude, stored.target_longitude);
+  return reply(message, `Твоё предположение принято!\nОчки: ${points} из 5000.\nПравильная точка и общие результаты появятся после завершения раунда.`);
 }
 
 async function mcp(env, request) {
