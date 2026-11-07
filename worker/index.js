@@ -238,7 +238,7 @@ export function multipart(location, round) {
   const fields = {
     chat_id: round.chat, caption: `Раунд #${round.id}\nПриём до ${timeLabel.format(round.ends * 1000)} МСК.`,
     reply_markup: JSON.stringify({ inline_keyboard: [[{
-      text: "Сделать предположение", url: `https://t.me/${game.bot}?start=${roundLinkPrefix}${round.id}`,
+      text: "Guess!", url: `https://t.me/${game.bot}?start=${roundLinkPrefix}${round.id}`,
     }]] }),
   };
   if (field === "video") {
@@ -376,7 +376,7 @@ async function delivery(env, item) {
 
   let text;
   if (item.kind === "guess") {
-    text = `${mention(item.user, row.name, row.username)} сделал предположение в раунде #${item.round}`;
+    text = `${mention(item.user, row.name, row.username)} сделал guess в раунде #${item.round}`;
   } else {
     const players = (await db(env, "SELECT user,name,username,latitude,longitude,submitted FROM guesses WHERE round=?", item.round).all()).results;
     text = leaderboard(row, players);
@@ -592,7 +592,7 @@ async function webhook(env, ctx, request) {
   const command = raw.split("@")[0];
 
   if (command === "/start") {
-    if (!args) return reply(message, `Открой раунд по кнопке «Сделать предположение».\n\nТвой Telegram ID: ${user}`);
+    if (!args) return reply(message, `Открой раунд по кнопке под постом в группе.\n\nТвой Telegram ID: ${user}`);
     const suffix = args.startsWith(roundLinkPrefix) ? args.slice(roundLinkPrefix.length) : "";
     const id = validId(suffix) ? Number(suffix) : 0;
     const round = await db(env, "SELECT * FROM rounds WHERE id=?", id).first();
