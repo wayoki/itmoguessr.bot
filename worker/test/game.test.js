@@ -73,6 +73,7 @@ test("multipart uses Telegram-safe names, inline round ID and no answer coordina
     const header = new TextDecoder().decode(result.header);
     assert.ok(header.includes(`name="${field}"; filename="round-4.${extension}"`));
     assert.ok(header.includes("https://t.me/itmoguessr_bot?start=round_v2_4"));
+    assert.match(header, /Раунд #4\nПриём до/);
     assert.ok(!header.includes("35.0116"));
     if (field === "video") assert.match(header, /name="width"\r\n\r\n1920/);
   }
@@ -103,13 +104,12 @@ test("webhook enforces secret and accepts a single guess, then reveals once", as
   const point = { location: { latitude: 48.8566, longitude: 2.3522 } };
   const results = await Promise.all([tg(point), tg(point)]);
   const replies = await Promise.all(results.map((result) => result.json()));
-  assert.equal(replies.filter(({ text }) => text === "5000/5000").length, 1);
+  assert.equal(replies.filter(({ text }) => text === "5000 / 5000").length, 1);
   assert.equal(replies.filter(({ text }) => text.includes("использовал")).length, 1);
   await Promise.all(tasks.splice(0));
   assert.equal(sent.length, 1);
-  assert.match(sent[0].text, /tg:\/\/user\?id=42/);
-  assert.match(sent[0].text, /&lt;Игрок&gt;/);
-  assert.doesNotMatch(sent[0].text, /48\.8566|5000|test_player/);
+  assert.match(sent[0].text, /href="https:\/\/t\.me\/test_player\?profile">&lt;Игрок&gt;<\/a>/);
+  assert.doesNotMatch(sent[0].text, /48\.8566|5000/);
 
   assert.match((await (await tg({ text: "/close 1" }, 43)).json()).text, /администраторам/);
   assert.match((await (await tg({ text: "/close 1" })).json()).text, /закрыт/);
@@ -231,8 +231,8 @@ test("leaderboard keeps ten players, links the display name and resolves equal s
     longitude: 0, submitted: 10 - i,
   })).reverse();
   const text = leaderboard({ id: 5, latitude: 0, longitude: 0 }, players);
-  assert.match(text, /<b>1\. <a href="tg:\/\/user\?id=1">&lt;player&gt;<\/a> — 5000<\/b>/);
-  assert.ok(!text.includes("first_player"));
+  assert.match(text, /<b>1\. <a href="https:\/\/t\.me\/first_player\?profile">&lt;player&gt;<\/a> — 5000<\/b>/);
+  assert.match(text, /2\. <a href="tg:\/\/user\?id=2">&lt;player&gt;<\/a>/);
   assert.match(text, /^Раунд #5 завершён\./);
   assert.equal(text.split("\n").filter((line) => /^(?:<b>)?\d+\./.test(line)).length, 10);
   assert.ok(!text.includes("<player>"));

@@ -236,7 +236,7 @@ export function multipart(location, round) {
   const [, field, extension] = location.format;
   const boundary = `itmoguessr-${crypto.randomUUID()}`;
   const fields = {
-    chat_id: round.chat, caption: `Раунд #${round.id}\nКуда нас занесло? Приём до ${timeLabel.format(round.ends * 1000)} МСК.`,
+    chat_id: round.chat, caption: `Раунд #${round.id}\nПриём до ${timeLabel.format(round.ends * 1000)} МСК.`,
     reply_markup: JSON.stringify({ inline_keyboard: [[{
       text: "Сделать предположение", url: `https://t.me/${game.bot}?start=${roundLinkPrefix}${round.id}`,
     }]] }),
@@ -328,8 +328,10 @@ async function publish(env, slot, end) {
 
 const validUsername = (username) => typeof username === "string" && /^[a-z0-9_]{1,32}$/i.test(username);
 const mention = (user, name, username) => {
-  const label = name?.trim() || (validUsername(username) ? "@" + username : "Игрок");
-  return `<a href="tg://user?id=${user}">${escapeHtml(label.slice(0, 80))}</a>`;
+  const hasUsername = validUsername(username);
+  const label = name?.trim() || (hasUsername ? "@" + username : "Игрок");
+  const profile = hasUsername ? `https://t.me/${username}?profile` : `tg://user?id=${user}`;
+  return `<a href="${profile}">${escapeHtml(label.slice(0, 80))}</a>`;
 };
 const googleMaps = (latitude, longitude) => `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${latitude},${longitude}`)}`;
 
@@ -627,7 +629,7 @@ async function webhook(env, ctx, request) {
     return reply(message, active ? duplicate : expired);
   }
   ctx.waitUntil(flush(env, 1).catch(logFailure("Guess notice")));
-  return reply(message, `${points}/5000`);
+  return reply(message, `${points} / 5000`);
 }
 
 async function mcp(env, request) {
