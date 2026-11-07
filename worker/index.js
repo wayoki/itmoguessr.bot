@@ -235,8 +235,10 @@ async function telegram(env, method, body, contentType = "application/json") {
 export function multipart(location, round) {
   const [, field, extension] = location.format;
   const boundary = `itmoguessr-${crypto.randomUUID()}`;
+  const deadline = timeLabel.formatToParts(round.ends * 1000)
+    .map(({ type, value }) => type === "hour" ? String(Number(value)) : value).join("");
   const fields = {
-    chat_id: round.chat, caption: `Раунд #${round.id}\nПриём до ${timeLabel.format(round.ends * 1000)} МСК.`,
+    chat_id: round.chat, caption: `Раунд #${round.id} (до ${deadline} МСК)`,
     reply_markup: JSON.stringify({ inline_keyboard: [[{
       text: "Guess!", url: `https://t.me/${game.bot}?start=${roundLinkPrefix}${round.id}`,
     }]] }),

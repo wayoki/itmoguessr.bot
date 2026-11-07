@@ -69,12 +69,12 @@ test("evening slot survives midnight and closes at nine Moscow time", () => {
 test("multipart uses Telegram-safe names, inline round ID and no answer coordinates", () => {
   for (const [field, type, extension] of [["photo","image/jpeg","jpg"], ["video","video/mp4","mp4"], ["animation","image/gif","gif"]]) {
     const result = multipart({ format: ["",field,extension], media: { mimeType: type, videoMediaMetadata: { width: 1920, height: 1080 } }, point: [35.0116,135.7681] },
-      { chat: "@swidfkjew", id: 4, ends: 1793923200 });
+      { chat: "@swidfkjew", id: 4, ends: Date.parse("2026-11-08T09:00:00+03:00") / 1000 });
     const header = new TextDecoder().decode(result.header);
     assert.ok(header.includes(`name="${field}"; filename="round-4.${extension}"`));
     assert.ok(header.includes("https://t.me/itmoguessr_bot?start=round_v2_4"));
     assert.match(header, /"text":"Guess!"/);
-    assert.match(header, /Раунд #4\nПриём до/);
+    assert.match(header, /Раунд #4 \(до 08\.11, 9:00 МСК\)/);
     assert.ok(!header.includes("35.0116"));
     if (field === "video") assert.match(header, /name="width"\r\n\r\n1920/);
   }
