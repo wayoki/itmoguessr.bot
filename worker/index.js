@@ -10,6 +10,7 @@ const game = {
   ],
 };
 const folderMime = "application/vnd.google-apps.folder";
+const roundLinkPrefix = "round_v2_";
 const mediaTypes = {
   "image/jpeg": ["sendPhoto", "photo", "jpg", 10_000_000],
   "image/png": ["sendPhoto", "photo", "png", 10_000_000],
@@ -156,7 +157,7 @@ async function scanLocations(env, cursor, limit) {
   const root = env.DRIVE_ROOT || game.drive;
   if (!driveId(root)) throw new Error("Invalid Drive root");
   const [usedRows, preparedRows, page] = await Promise.all([
-    db(env, "SELECT folder FROM rounds WHERE status<>'failed'").all(),
+    db(env, "SELECT folder FROM rounds WHERE status<>'failed' UNION SELECT folder FROM retired_locations").all(),
     db(env, "SELECT * FROM prepared_media").all(),
     driveFetch(env, "", {
       q: folderQuery(root, `mimeType='${folderMime}' or ${mediaQuery}`), orderBy: "name", pageSize: "50",
@@ -237,7 +238,7 @@ export function multipart(location, round) {
   const fields = {
     chat_id: round.chat, caption: `Раунд #${round.id}\nКуда нас занесло? Приём до ${timeLabel.format(round.ends * 1000)} МСК.`,
     reply_markup: JSON.stringify({ inline_keyboard: [[{
-      text: "Сделать предположение", url: `https://t.me/${game.bot}?start=round_${round.id}`,
+      text: "Сделать предположение", url: `https://t.me/${game.bot}?start=${roundLinkPrefix}${round.id}`,
     }]] }),
   };
   if (field === "video") {
@@ -337,13 +338,11 @@ export function leaderboard(round, players) {
     ...player, ...score(player.latitude, player.longitude, round.latitude, round.longitude),
   })).sort((a, b) => b.points - a.points || a.km - b.km || a.submitted - b.submitted || a.user - b.user).slice(0, 10);
   const heading = round.corrected ? `🛠 Исправление раунда #${round.id}` : `Раунд #${round.id} завершён.`;
-  const lines = [`${heading} Участников: ${players.length}.`];
-  if (!top.length) return lines.join("\n");
-  const winner = top[0];
-  lines.push(`🏆 <b>Победитель</b> — ${mention(winner.user, winner.name, winner.username)} · ${winner.points} очков`, "", "<b>Топ‑10</b>");
-  lines.push(...top.map((player, index) =>
-    `${index + 1}. ${mention(player.user, player.name, player.username)} — ${player.points}`));
-  return lines.join("\n");
+  const lines = top.map((player, index) => {
+    const line = `${index + 1}. ${mention(player.user, player.name, player.username)} — ${player.points}`;
+    return index === 0 ? `<b>${line}</b>` : line;
+  });
+  return top.length ? [heading, "", ...lines].join("\n") : heading;
 }
 
 async function inventory(env) {
@@ -361,7 +360,8 @@ async function delivery(env, item) {
     if (!chatId) return null;
     return { method: "sendMessage", body: { chat_id: chatId, text: await inventory(env) } };
   }
-  const row = await db(env, `SELECT r.id,r.latitude,r.longitude,g.latitude AS guess_lat,g.longitude AS guess_lon,g.name,g.username,
+  if (item.kind === "result") return null;
+  const row = await db(env, `SELECT r.id,r.latitude,r.longitude,g.name,g.username,
     EXISTS(SELECT 1 FROM settings WHERE key='correction:' || r.id) AS corrected
     FROM rounds r LEFT JOIN guesses g ON g.round=r.id AND g.user=? WHERE r.id=?`, item.user, item.round).first();
   const maps = googleMaps(row.latitude, row.longitude);
@@ -375,15 +375,9 @@ async function delivery(env, item) {
   let text;
   if (item.kind === "guess") {
     text = `${mention(item.user, row.name, row.username)} сделал предположение в раунде #${item.round}`;
-  } else if (item.kind === "reveal") {
+  } else {
     const players = (await db(env, "SELECT user,name,username,latitude,longitude,submitted FROM guesses WHERE round=?", item.round).all()).results;
     text = leaderboard(row, players);
-  } else {
-    const { km, points } = score(row.guess_lat, row.guess_lon, row.latitude, row.longitude);
-    await db(env, "UPDATE guesses SET distance=?,points=? WHERE round=? AND user=?", km, points, item.round, item.user).run();
-    const heading = row.corrected ? `🛠 Исправление раунда #${item.round}` : `Раунд #${item.round} завершён.`;
-    text = `${heading}\nПравильная точка: ${row.latitude}, ${row.longitude}\n` +
-      `Расстояние: ${km.toFixed(2)} км\nОчки: ${points} из 5000\n<a href="${maps.replaceAll("&", "&amp;")}">Открыть Google Maps</a>`;
   }
   return { method: "sendMessage", body: { chat_id: chatId, text, parse_mode: "HTML", link_preview_options: { is_disabled: true } } };
 }
@@ -455,11 +449,34 @@ async function verifyDrive(env) {
   if (meta.trashed || meta.mimeType !== folderMime) throw new Error("Drive root is not a folder");
 }
 
+export async function resetTestRounds(env) {
+  const canReset = `EXISTS(SELECT 1 FROM settings WHERE key='paused' AND value='1')
+    AND NOT EXISTS(SELECT 1 FROM settings WHERE key='club_launched')`;
+  await env.DB.batch([
+    db(env, `INSERT OR IGNORE INTO retired_locations SELECT folder FROM rounds WHERE status<>'failed' AND ${canReset}`),
+    db(env, `DELETE FROM outbox WHERE ${canReset}`),
+    db(env, `DELETE FROM selected WHERE ${canReset}`),
+    db(env, `DELETE FROM guesses WHERE ${canReset}`),
+    db(env, `DELETE FROM rounds WHERE ${canReset}`),
+    db(env, `DELETE FROM settings WHERE (key='drive_cursor_v2' OR key LIKE 'correction:%') AND ${canReset}`),
+    db(env, `INSERT INTO settings SELECT 'club_launched','1' WHERE ${canReset}`),
+  ]);
+  return Boolean(await db(env, "SELECT 1 FROM settings WHERE key='club_launched'").first());
+}
+
 async function admin(env, ctx, message, command, args, updateId) {
   if (!String(env.ADMIN_IDS || "").split(/[,\s]+/).includes(String(message.from.id))) {
     return reply(message, "Эта команда доступна администраторам.");
   }
   switch (command) {
+    case "/reset_test_rounds": {
+      if (!env.TELEGRAM_CHANNEL || env.TELEGRAM_CHANNEL === game.chat) {
+        return reply(message, "Сначала укажи новую группу.");
+      }
+      const reset = await resetTestRounds(env);
+      return reply(message, reset ? "Тестовые раунды и ответы очищены. Нумерация клубных раундов начинается с #1." :
+        "Сначала поставь автоматические публикации на паузу.");
+    }
     case "/status": {
       const now = clock();
       const active = (await db(env, "SELECT id,ends,message_id FROM rounds WHERE status='active' ORDER BY ends").all()).results;
@@ -469,12 +486,11 @@ async function admin(env, ctx, message, command, args, updateId) {
       const lastTick = await db(env, "SELECT value FROM settings WHERE key='last_tick'").first("value");
       const googleTick = await db(env, "SELECT value FROM settings WHERE key='last_apps_script_tick'").first("value");
       const lastClosed = await db(env, `SELECT r.id,
-        (SELECT message_id FROM outbox WHERE round=r.id AND kind='reveal' AND status='sent') AS reveal_message,
-        (SELECT COUNT(*) FROM guesses WHERE round=r.id) AS players,
-        (SELECT COUNT(*) FROM outbox WHERE round=r.id AND kind='result' AND status='sent') AS delivered
+        (SELECT message_id FROM outbox WHERE round=r.id AND kind='reveal' AND status='sent') AS reveal_message
         FROM rounds r WHERE r.status='closed' ORDER BY r.ends DESC, r.id DESC LIMIT 1`).first();
       return reply(message, [
         `Расписание: ${env.SCHEDULE_ENABLED !== "true" ? "выключено" : paused === "1" ? "на паузе" : "включено"}.`,
+        `Группа публикаций — ${chat(env)}.`,
         ...(lastTick ? [`Последняя проверка расписания — ${timeLabel.format(Number(lastTick) * 1000)} МСК.`] : []),
         ...(googleTick ? [`Последняя проверка из Google — ${timeLabel.format(Number(googleTick) * 1000)} МСК.`] : []),
         ...active.map((round) => round.ends <= now
@@ -482,7 +498,7 @@ async function admin(env, ctx, message, command, args, updateId) {
           : `Раунд #${round.id} до ${timeLabel.format(round.ends * 1000)} МСК (сообщение #${round.message_id}).`),
         ...(!active.some((round) => round.ends > now) ? ["Активных раундов нет."] : []),
         ...(lastClosed ? [`Последний закрытый раунд #${lastClosed.id}. Таблица: ${lastClosed.reveal_message
-          ? `сообщение #${lastClosed.reveal_message}` : "отправка не подтверждена"}. Личные результаты: ${lastClosed.delivered}/${lastClosed.players}.`] : []),
+          ? `сообщение #${lastClosed.reveal_message}` : "отправка не подтверждена"}.`] : []),
         `Публикаций с неизвестным исходом: ${publication}.`,
         ...counts.map(({ status, count }) => `Уведомления (${status}): ${count}.`),
       ].join("\n"));
@@ -575,7 +591,8 @@ async function webhook(env, ctx, request) {
 
   if (command === "/start") {
     if (!args) return reply(message, `Открой раунд по кнопке «Сделать предположение».\n\nТвой Telegram ID: ${user}`);
-    const id = args.startsWith("round_") && validId(args.slice(6)) ? Number(args.slice(6)) : 0;
+    const suffix = args.startsWith(roundLinkPrefix) ? args.slice(roundLinkPrefix.length) : "";
+    const id = validId(suffix) ? Number(suffix) : 0;
     const round = await db(env, "SELECT * FROM rounds WHERE id=?", id).first();
     if (!round) {
       await db(env, "DELETE FROM selected WHERE user=?", user).run();
@@ -594,24 +611,23 @@ async function webhook(env, ctx, request) {
       Math.abs(point.latitude) > 90 || Math.abs(point.longitude) > 180) {
     return reply(message, "Отправь выбранную точку на карте как обычную геопозицию.");
   }
-  const selected = await db(env, "SELECT round FROM selected WHERE user=?", user).first("round");
-  if (!selected) return reply(message, "Сначала открой раунд по кнопке в канале.");
+  const round = await db(env, "SELECT r.* FROM selected s JOIN rounds r ON r.id=s.round WHERE s.user=?", user).first();
+  if (!round) return reply(message, "Сначала открой раунд по кнопке в группе.");
   const name = [message.from.first_name, message.from.last_name].filter(Boolean).join(" ");
   const now = clock();
-  const stored = await db(env, `INSERT INTO guesses(round,user,name,latitude,longitude,announcement,submitted,username)
-    SELECT id,?,?,?,?,?,?,? FROM rounds WHERE id=? AND status='active' AND ends>?
-    ON CONFLICT(round,user) DO NOTHING RETURNING
-      (SELECT latitude FROM rounds WHERE id=guesses.round) AS target_latitude,
-      (SELECT longitude FROM rounds WHERE id=guesses.round) AS target_longitude`,
+  if (round.status !== "active" || round.ends <= now) return reply(message, expired);
+  const { km, points } = score(point.latitude, point.longitude, round.latitude, round.longitude);
+  const stored = await db(env, `INSERT INTO guesses(round,user,name,latitude,longitude,announcement,submitted,username,distance,points)
+    SELECT id,?,?,?,?,?,?,?,?,? FROM rounds WHERE id=? AND status='active' AND ends>?
+    ON CONFLICT(round,user) DO NOTHING RETURNING round`,
   user, name, point.latitude, point.longitude, announcementChat(env), now,
-    validUsername(message.from.username) ? message.from.username : null, selected, now).first();
+    validUsername(message.from.username) ? message.from.username : null, km, points, round.id, now).first();
   if (!stored) {
-    const active = await db(env, "SELECT 1 FROM rounds WHERE id=? AND status='active' AND ends>?", selected, now).first();
+    const active = await db(env, "SELECT 1 FROM rounds WHERE id=? AND status='active' AND ends>?", round.id, now).first();
     return reply(message, active ? duplicate : expired);
   }
   ctx.waitUntil(flush(env, 1).catch(logFailure("Guess notice")));
-  const { points } = score(point.latitude, point.longitude, stored.target_latitude, stored.target_longitude);
-  return reply(message, `Твоё предположение принято!\nОчки: ${points} из 5000.\nПравильная точка и общие результаты появятся после завершения раунда.`);
+  return reply(message, `${points}/5000`);
 }
 
 async function mcp(env, request) {

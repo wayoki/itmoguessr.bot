@@ -3,13 +3,17 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
-import worker, { activeSlots, coordinates, filenameCoordinates, leaderboard, multipart, score } from "../index.js";
+import worker, { activeSlots, coordinates, filenameCoordinates, leaderboard, multipart, resetTestRounds, score } from "../index.js";
+
+const clubMigration = "0003_start_club_rounds.sql";
+const applyMigration = (sql, name) => sql.exec(readFileSync(new URL("../drizzle/" + name, import.meta.url), "utf8"));
 
 function database() {
   const sql = new DatabaseSync(":memory:");
   for (const name of ["0000_game.sql", "0001_reveal_and_prepared_media.sql", "0002_round_corrections.sql"]) {
-    sql.exec(readFileSync(new URL("../drizzle/" + name, import.meta.url), "utf8"));
+    applyMigration(sql, name);
   }
+  applyMigration(sql, clubMigration);
   const DB = {
     prepare(query) {
       return {
@@ -68,7 +72,7 @@ test("multipart uses Telegram-safe names, inline round ID and no answer coordina
       { chat: "@swidfkjew", id: 4, ends: 1793923200 });
     const header = new TextDecoder().decode(result.header);
     assert.ok(header.includes(`name="${field}"; filename="round-4.${extension}"`));
-    assert.ok(header.includes("https://t.me/itmoguessr_bot?start=round_4"));
+    assert.ok(header.includes("https://t.me/itmoguessr_bot?start=round_v2_4"));
     assert.ok(!header.includes("35.0116"));
     if (field === "video") assert.match(header, /name="width"\r\n\r\n1920/);
   }
@@ -93,16 +97,14 @@ test("webhook enforces secret and accepts a single guess, then reveals once", as
   });
   const now = Math.floor(Date.now() / 1000);
   sql.prepare("INSERT INTO rounds VALUES(1,'test','drive-folder',48.8566,2.3522,'@swidfkjew',?,55,'active',?)").run(now + 3600, now);
-  assert.equal((await tg({ text: "/start round_1" }, 42, "wrong")).status, 403);
-  assert.match((await (await tg({ text: "/start round_1" })).json()).text, /Раунд #1/);
+  assert.equal((await tg({ text: "/start round_v2_1" }, 42, "wrong")).status, 403);
+  assert.match((await (await tg({ text: "/start round_1" })).json()).text, /приём ответов.*закрыт/i);
+  assert.match((await (await tg({ text: "/start round_v2_1" })).json()).text, /Раунд #1/);
   const point = { location: { latitude: 48.8566, longitude: 2.3522 } };
   const results = await Promise.all([tg(point), tg(point)]);
   const replies = await Promise.all(results.map((result) => result.json()));
-  assert.equal(replies.filter(({ text }) => text.includes("принято")).length, 1);
+  assert.equal(replies.filter(({ text }) => text === "5000/5000").length, 1);
   assert.equal(replies.filter(({ text }) => text.includes("использовал")).length, 1);
-  const accepted = replies.find(({ text }) => text.includes("принято"));
-  assert.match(accepted.text, /Очки: 5000 из 5000/);
-  assert.doesNotMatch(accepted.text, /48\.8566|2\.3522|maps/);
   await Promise.all(tasks.splice(0));
   assert.equal(sent.length, 1);
   assert.match(sent[0].text, /tg:\/\/user\?id=42/);
@@ -112,37 +114,35 @@ test("webhook enforces secret and accepts a single guess, then reveals once", as
   assert.match((await (await tg({ text: "/close 1" }, 43)).json()).text, /администраторам/);
   assert.match((await (await tg({ text: "/close 1" })).json()).text, /закрыт/);
   await Promise.all(tasks.splice(0));
-  assert.equal(sent.length, 4);
-  assert.match(sent.find(({ chat_id }) => chat_id === "42").text, /Очки: 5000/);
+  assert.equal(sent.length, 3);
+  assert.equal(sql.prepare("SELECT count(*) AS n FROM outbox WHERE kind='result'").get().n, 0);
   const map = sent.find(({ method }) => method === "sendLocation");
   assert.equal(map.latitude, 48.8566);
   assert.match(map.reply_markup.inline_keyboard[0][0].url, /^https:\/\/www.google.com\/maps/);
-  const rank = sent.find(({ text }) => text?.includes("Участников"));
-  assert.match(rank.text, /Участников: 1/);
-  assert.match(rank.text, /🏆.*Победитель/);
-  assert.match(rank.text, /1\. .*Игрок.*5000/);
+  const rank = sent.find(({ text }) => text?.includes("Раунд #1 завершён."));
+  assert.match(rank.text, /^Раунд #1 завершён\.\n\n<b>1\. .*Игрок.*5000<\/b>$/);
   const maintenance = () => request("/mcp", { "oai-authenticated-user-email": "owner@example.test" },
     { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "run_training_schedule" } });
   assert.equal((await (await maintenance()).json()).result.isError, undefined);
-  assert.equal(sent.length, 4);
+  assert.equal(sent.length, 3);
   assert.match((await (await tg(point)).json()).text, /приём ответов.*закрыт/i);
   assert.equal(sql.prepare("SELECT points FROM guesses").get().points, 5000);
   assert.match((await (await tg({ text: "/correct 1 56.62567, 23.34348" }, 43)).json()).text, /администраторам/);
   assert.match((await (await tg({ text: "/correct 1 56.62567, 23.34348" })).json()).text, /исправлена/);
   await Promise.all(tasks.splice(0));
-  const corrections = sent.slice(4);
-  assert.equal(corrections.length, 3);
+  const corrections = sent.slice(3);
+  assert.equal(corrections.length, 2);
   assert.equal(corrections[0].latitude, 56.62567);
   assert.equal(corrections[0].longitude, 23.34348);
   assert.ok(corrections.slice(1).every(({ text }) => text.includes("Исправление раунда #1")));
-  assert.notEqual(sql.prepare("SELECT points FROM guesses").get().points, 5000);
+  assert.doesNotMatch(corrections[1].text, /5000/);
   assert.match((await (await tg({ text: "/correct 1 56.62567, 23.34348" })).json()).text, /уже сохранены/);
   await Promise.all(tasks.splice(0));
-  assert.equal(sent.length, 7);
+  assert.equal(sent.length, 5);
   sql.close();
 });
 
-test("manual MP4 round streams a private Drive file into Telegram once", async (t) => {
+test("MP4 and screenshot rounds stream private Drive files into Telegram once each", async (t) => {
   const { sql, DB } = database();
   const calls = [];
   const background = [];
@@ -174,35 +174,41 @@ test("manual MP4 round streams a private Drive file into Telegram once", async (
       if (api.pathname.endsWith("/demo-root")) {
         return Response.json({ mimeType: "application/vnd.google-apps.folder" });
       }
-      if (api.pathname.endsWith("/fake-file")) {
+      if (["/fake-file", "/fake-photo"].some((suffix) => api.pathname.endsWith(suffix))) {
         assert.equal(api.searchParams.get("alt"), "media");
         return new Response(fixture);
       }
       if (api.searchParams.get("q").startsWith("'demo-root'")) {
-        return Response.json({ files: [{ id: "demo-folder", name: "35.0116, 135.7681", mimeType: "application/vnd.google-apps.folder" }] });
+        return Response.json({ files: [
+          { id: "demo-folder", name: "35.0116, 135.7681", mimeType: "application/vnd.google-apps.folder" },
+          { id: "fake-photo", name: "45.0116, 125.7681.png", mimeType: "image/png", size: String(fixture.length), capabilities: { canDownload: true } },
+        ] });
       }
       return Response.json({
         files: [{ id: "fake-file", mimeType: "video/mp4", size: String(fixture.length), capabilities: { canDownload: true } }],
       });
     }
     calls.push(api.pathname.split("/").at(-1));
-    if (api.pathname.endsWith("/sendVideo")) {
+    if (api.pathname.endsWith("/sendVideo") || api.pathname.endsWith("/sendPhoto")) {
       const media = await new Response(options.body).text();
-      assert.match(media, /filename="round-1.mp4"/);
+      const video = api.pathname.endsWith("/sendVideo");
+      assert.ok(media.includes(video ? 'name="video"; filename="round-1.mp4"' : 'name="photo"; filename="round-2.png"'));
       assert.match(media, /test mp4 fixture/);
-      assert.match(media, /round_1/);
-      assert.ok(!media.includes("35.0116"));
+      assert.ok(media.includes(video ? "round_v2_1" : "round_v2_2"));
+      assert.doesNotMatch(media, /35\.0116|45\.0116/);
+      assert.match(media, /-1001234567890/);
     }
     return Response.json({ ok: true, result: { message_id: 321 } });
   });
   const env = {
     DB, BOT_TOKEN: "test-token", WEBHOOK_SECRET: "secret", ADMIN_IDS: "42", DRIVE_ROOT: "demo-root",
+    TELEGRAM_CHANNEL: "-1001234567890",
     DRIVE_SERVICE_ACCOUNT: JSON.stringify({ type: "service_account", client_email: "fake@example.test", private_key: pem }),
   };
   const ctx = { waitUntil: (promise) => background.push(promise) };
-  const next = () => worker.fetch(new Request("https://bot.example/telegram", {
+  const next = (updateId = 5) => worker.fetch(new Request("https://bot.example/telegram", {
     method: "POST", headers: { "X-Telegram-Bot-Api-Secret-Token": "secret" },
-    body: JSON.stringify({ update_id: 5, message: { chat: { type: "private", id: 42 }, from: { id: 42 }, text: "/next" } }),
+    body: JSON.stringify({ update_id: updateId, message: { chat: { type: "private", id: 42 }, from: { id: 42 }, text: "/next" } }),
   }), env, ctx);
   assert.match((await (await next()).json()).text, /запускаю раунд/);
   await Promise.all(background.splice(0));
@@ -212,6 +218,10 @@ test("manual MP4 round streams a private Drive file into Telegram once", async (
   const round = sql.prepare("SELECT status,message_id FROM rounds WHERE id=1").get();
   assert.equal(round.status, "active");
   assert.equal(round.message_id, 321);
+  await next(6);
+  await Promise.all(background.splice(0));
+  assert.deepEqual(calls, ["sendVideo", "sendMessage", "sendPhoto", "sendMessage"]);
+  assert.equal(sql.prepare("SELECT status FROM rounds WHERE id=2").get().status, "active");
   sql.close();
 });
 
@@ -221,11 +231,32 @@ test("leaderboard keeps ten players, links the display name and resolves equal s
     longitude: 0, submitted: 10 - i,
   })).reverse();
   const text = leaderboard({ id: 5, latitude: 0, longitude: 0 }, players);
-  assert.match(text, /🏆 .*tg:\/\/user\?id=1">&lt;player&gt;<\/a>/);
+  assert.match(text, /<b>1\. <a href="tg:\/\/user\?id=1">&lt;player&gt;<\/a> — 5000<\/b>/);
   assert.ok(!text.includes("first_player"));
-  assert.match(text, /Участников: 12/);
-  assert.equal(text.split("\n").filter((line) => /^\d+\./.test(line)).length, 10);
+  assert.match(text, /^Раунд #5 завершён\./);
+  assert.equal(text.split("\n").filter((line) => /^(?:<b>)?\d+\./.test(line)).length, 10);
   assert.ok(!text.includes("<player>"));
+});
+
+test("club reset clears test rounds and players once, preserves the pause and excludes old media", async () => {
+  const { sql, DB } = database();
+  sql.exec(`INSERT INTO rounds VALUES(6,'old-slot','file:old',40,20,'@old',30,3,'active',31);
+    INSERT INTO selected VALUES(42,6);
+    INSERT INTO guesses(round,user,name,latitude,longitude,announcement,submitted) VALUES(6,42,'Player',40,20,'@old',28);
+    INSERT INTO settings VALUES('drive_cursor_v2','{}'),('correction:6','1');`);
+  assert.equal(await resetTestRounds({ DB }), false);
+  assert.equal(sql.prepare("SELECT id FROM rounds").get().id, 6);
+  sql.exec("INSERT INTO settings VALUES('paused','1')");
+  assert.equal(await resetTestRounds({ DB }), true);
+  for (const table of ["rounds", "guesses", "selected", "outbox"]) {
+    assert.equal(sql.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count, 0);
+  }
+  assert.equal(sql.prepare("SELECT folder FROM retired_locations").get().folder, "file:old");
+  assert.deepEqual(sql.prepare("SELECT key FROM settings ORDER BY key").all().map(row => row.key), ["club_launched", "paused"]);
+  sql.exec("INSERT INTO rounds(slot,folder,latitude,longitude,chat,ends,status,updated) VALUES('new-slot','file:new',40,20,'@new',30,'active',31)");
+  assert.equal(await resetTestRounds({ DB }), true);
+  assert.equal(sql.prepare("SELECT id FROM rounds").get().id, 1);
+  sql.close();
 });
 
 test("authenticated schedule wake reveals an expired round exactly once", async (t) => {
