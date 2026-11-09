@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
-import worker, { activeSlots, coordinates, filenameCoordinates, leaderboard, multipart, resetTestRounds, score } from "../index.js";
+import worker, { activeSlots, coordinates, filenameCoordinates, leaderboard, multipart, resetTestRounds, score, weeklySummary, weeklyWindow } from "../index.js";
 
 const clubMigration = "0003_start_club_rounds.sql";
 const applyMigration = (sql, name) => sql.exec(readFileSync(new URL("../drizzle/" + name, import.meta.url), "utf8"));
@@ -14,6 +14,7 @@ function database() {
     applyMigration(sql, name);
   }
   applyMigration(sql, clubMigration);
+  applyMigration(sql, "0004_weekly_reports.sql");
   const DB = {
     prepare(query) {
       return {
@@ -64,6 +65,37 @@ test("evening slot survives midnight and closes at nine Moscow time", () => {
   assert.equal(activeSlots(unix("2026-11-06T08:59:00+03:00"))[0].key, "evening:2026-11-05");
   assert.equal(activeSlots(unix("2026-11-06T09:00:00+03:00")).length, 0);
   assert.equal(activeSlots(unix("2026-11-06T10:00:00+03:00"))[0].key, "morning:2026-11-06");
+});
+
+test("weekly report starts Sunday at 8:30 Moscow time and includes all of Saturday", () => {
+  const unix = (date) => Date.parse(date) / 1000;
+  assert.equal(weeklyWindow(unix("2026-11-14T23:59:59+03:00")), null);
+  assert.equal(weeklyWindow(unix("2026-11-15T08:29:59+03:00")), null);
+  assert.deepEqual(weeklyWindow(unix("2026-11-15T08:30:00+03:00")), {
+    start: unix("2026-11-08T00:00:00+03:00"), end: unix("2026-11-15T00:00:00+03:00"),
+  });
+  assert.equal(weeklyWindow(unix("2026-11-16T08:30:00+03:00")), null);
+});
+
+test("weekly top three ranks activity, mean score and percentage improvement", () => {
+  const rows = [
+    { user: 1, name: "<Первый>", submitted: 103, points: 3000 },
+    { user: 1, name: "Старое имя", submitted: 102, points: 2000 },
+    { user: 1, name: "Старое имя", submitted: 101, points: 1000 },
+    { user: 2, name: "Точный", submitted: 102, points: 5000 },
+    { user: 2, name: "Точный", submitted: 101, points: 4000 },
+    { user: 3, name: "Третий", submitted: 101, points: 1000 },
+    { user: 4, name: "Дебютант", submitted: 101, points: 1 },
+    { user: 1, name: "Первый", submitted: 99, points: 1000 },
+    { user: 2, name: "Точный", submitted: 99, points: 3000 },
+    { user: 3, name: "Третий", submitted: 99, points: 0 },
+  ];
+  const [, activity, accuracy, progress] = weeklySummary(rows, 100, true).split("\n\n");
+  assert.match(activity, /1\. .*&lt;Первый&gt;.*\(3 сыгранных раунда за неделю\)/);
+  assert.match(accuracy, /1\. .*Точный.*\(4\s500 очков в среднем\)/);
+  assert.match(progress, /1\. .*&lt;Первый&gt;.*на 100%\)\n2\. .*Точный.*на 50%\)$/);
+  for (const section of [activity, accuracy]) assert.equal(section.split("\n").length, 4);
+  assert.doesNotMatch(weeklySummary(rows, 100, false), /Самые прогрессирующие/);
 });
 
 test("multipart uses Telegram-safe names, inline round ID and no answer coordinates", () => {
@@ -280,6 +312,37 @@ test("authenticated schedule wake reveals an expired round exactly once", async 
   assert.match(sent[1].text, /Раунд #1 завершён/);
   assert.equal(sql.prepare("SELECT status FROM rounds").get().status, "closed");
   assert.ok(Number(sql.prepare("SELECT value FROM settings WHERE key='last_tick'").get().value) >= now);
+  sql.close();
+});
+
+test("Sunday schedule publishes the previous week's report once without closing the active round", async (t) => {
+  const { sql, DB } = database();
+  const sent = [];
+  t.mock.method(Date, "now", () => Date.parse("2026-11-15T08:30:00+03:00"));
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    assert.match(url, /\/sendMessage$/);
+    sent.push(JSON.parse(options.body));
+    return Response.json({ ok: true, result: { message_id: 111 } });
+  });
+  const cutoff = Date.parse("2026-11-15T00:00:00+03:00") / 1000;
+  sql.prepare("INSERT INTO rounds VALUES(1,'evening:2026-11-14','file:video',48,2,'@club',?,55,'active',?)")
+    .run(cutoff + 9 * 3600, cutoff - 4 * 3600);
+  const guess = sql.prepare("INSERT INTO guesses(round,user,name,latitude,longitude,announcement,submitted,points) VALUES(1,?,?,48,2,'@club',?,5000)");
+  guess.run(42, "Суббота", cutoff - 1);
+  guess.run(43, "Воскресенье", cutoff);
+  sql.exec("UPDATE outbox SET status='sent'");
+  const env = { DB, BOT_TOKEN: "test-token", TELEGRAM_CHANNEL: "@club", MEDIA_PREPARER_KEY: "secret", SCHEDULE_ENABLED: "true" };
+  const wake = () => worker.fetch(new Request("https://bot.example/media/wake", {
+    method: "POST", headers: { "X-ITMOGUESSR-Media-Key": "secret" },
+  }), env, {});
+  assert.equal((await wake()).status, 200);
+  assert.equal((await wake()).status, 200);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].chat_id, "@club");
+  assert.match(sent[0].text, /Итоги недели!.*Суббота/s);
+  assert.doesNotMatch(sent[0].text, /Воскресенье|Самые прогрессирующие/);
+  assert.equal(sql.prepare("SELECT message_id FROM weekly_reports WHERE status='sent'").get().message_id, 111);
+  assert.equal(sql.prepare("SELECT status FROM rounds").get().status, "active");
   sql.close();
 });
 

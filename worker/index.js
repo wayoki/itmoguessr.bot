@@ -4,6 +4,7 @@ const game = {
   drive: "1rlP26NNEgdsHkv1n1QGo9SAkaT6aCady",
   timezone: "Europe/Moscow",
   manualMinutes: 120,
+  weeklyPublish: "08:30",
   slots: [
     { name: "morning", publish: "10:00", reveal: "19:00" },
     { name: "evening", publish: "20:00", reveal: "09:00" },
@@ -11,6 +12,8 @@ const game = {
 };
 const folderMime = "application/vnd.google-apps.folder";
 const roundLinkPrefix = "round_v2_";
+const daySeconds = 86400;
+const weekSeconds = 7 * daySeconds;
 const mediaTypes = {
   "image/jpeg": ["sendPhoto", "photo", "jpg", 10_000_000],
   "image/png": ["sendPhoto", "photo", "png", 10_000_000],
@@ -69,22 +72,29 @@ function parts(unix) {
   return Object.fromEntries(dateParts.formatToParts(unix * 1000).map(({ type, value }) => [type, value]));
 }
 
+function localEpoch(day, time) {
+  const target = day + (+time.slice(0, 2) * 60 + +time.slice(3)) * 60;
+  const seen = parts(target);
+  const localAtTarget = Date.UTC(+seen.year, +seen.month - 1, +seen.day, +seen.hour, +seen.minute) / 1000;
+  return target - (localAtTarget - target);
+}
+
 export function activeSlots(now) {
   const local = parts(now);
   const nominal = Date.UTC(+local.year, +local.month - 1, +local.day) / 1000;
-  const minutes = (time) => +time.slice(0, 2) * 60 + +time.slice(3);
-  const epoch = (day, time) => {
-    const target = day + minutes(time) * 60;
-    const seen = parts(target);
-    const localAtTarget = Date.UTC(+seen.year, +seen.month - 1, +seen.day, +seen.hour, +seen.minute) / 1000;
-    return target - (localAtTarget - target);
-  };
-  return [nominal - 86400, nominal].flatMap((day) =>
+  return [nominal - daySeconds, nominal].flatMap((day) =>
     game.slots.map(({ name, publish, reveal }) => ({
       key: `${name}:${new Date(day * 1000).toISOString().slice(0, 10)}`,
-      start: epoch(day, publish), end: epoch(day + (reveal < publish ? 86400 : 0), reveal),
+      start: localEpoch(day, publish), end: localEpoch(day + (reveal < publish ? daySeconds : 0), reveal),
     })).filter(({ start, end }) => start <= now && now < end),
   );
+}
+
+export function weeklyWindow(now) {
+  const local = parts(now);
+  const today = Date.UTC(+local.year, +local.month - 1, +local.day) / 1000;
+  if (new Date(today * 1000).getUTCDay() !== 0 || now < localEpoch(today, game.weeklyPublish)) return null;
+  return { start: localEpoch(today - weekSeconds, "00:00"), end: localEpoch(today, "00:00") };
 }
 
 class ApiFailure extends Error {
@@ -356,6 +366,94 @@ export function leaderboard(round, players) {
   return top.length ? [heading, "", ...lines].join("\n") : heading;
 }
 
+const weeklyNumber = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 1 });
+const weeklyPlural = new Intl.PluralRules("ru", { maximumFractionDigits: 1 });
+const playedRoundWord = { one: "сыгранный раунд", few: "сыгранных раунда", many: "сыгранных раундов", other: "сыгранных раундов" };
+
+export function weeklySummary(rows, start, compare) {
+  const current = new Map();
+  const previous = new Map();
+  for (const row of rows) {
+    const week = row.submitted >= start ? current : previous;
+    if (!week.has(row.user)) {
+      week.set(row.user, { user: row.user, name: row.name, username: row.username, rounds: 0, total: 0 });
+    }
+    const player = week.get(row.user);
+    player.rounds++;
+    player.total += row.points ?? score(row.latitude, row.longitude, row.target_latitude, row.target_longitude).points;
+  }
+  const title = "<b>Итоги недели!</b>";
+  if (!current.size) return `${title}\n\nЗа неделю никто не сыграл.`;
+  const average = (player) => player.total / player.rounds;
+  const byActivity = (a, b) => b.rounds - a.rounds || average(b) - average(a) || a.user - b.user;
+  const byAccuracy = (a, b) => average(b) - average(a) || b.rounds - a.rounds || a.user - b.user;
+  const section = (heading, players, detail) => [
+    `<b>${heading}:</b>`,
+    ...players.slice(0, 3).map((player, index) =>
+      `${index + 1}. ${mention(player.user, player.name, player.username)} (${detail(player)})`),
+  ].join("\n");
+  const players = [...current.values()];
+  const sections = [
+    title,
+    section("Самые активные", players.toSorted(byActivity),
+      ({ rounds }) => `${rounds} ${playedRoundWord[pointPlural.select(rounds)]} за неделю`),
+    section("Самые точные", players.toSorted(byAccuracy), (player) => {
+      const avg = average(player);
+      return `${weeklyNumber.format(avg)} ${pointWord[weeklyPlural.select(avg)]} в среднем`;
+    }),
+  ];
+  if (compare) {
+    const progress = players.flatMap((player) => {
+      const prior = previous.get(player.user);
+      if (!prior || prior.total === 0 || average(player) <= average(prior)) return [];
+      return [{ ...player, improvement: 100 * (average(player) - average(prior)) / average(prior) }];
+    }).sort((a, b) => b.improvement - a.improvement || byAccuracy(a, b));
+    sections.push(progress.length
+      ? section("Самые прогрессирующие", progress, ({ improvement }) =>
+        `улучшил показатели на ${weeklyNumber.format(improvement) === "0" ? "&lt;0,1" : weeklyNumber.format(improvement)}%`)
+      : "<b>Самые прогрессирующие:</b>\nПока нет участников с ростом среднего результата за обе недели.");
+  }
+  return sections.join("\n\n");
+}
+
+async function publishWeeklyReport(env, now) {
+  const window = weeklyWindow(now);
+  if (!window) return;
+  const { start, end } = window;
+  const existing = await db(env, "SELECT status,updated FROM weekly_reports WHERE week_start=?", start).first();
+  if (existing?.status === "sending" && existing.updated < now - 180) {
+    await db(env, "UPDATE weekly_reports SET status='uncertain' WHERE week_start=? AND status='sending' AND updated<?",
+      start, now - 180).run();
+    return;
+  }
+  if (existing && existing.status !== "pending") return;
+  if (!existing) {
+    const compare = Boolean(await db(env, "SELECT 1 FROM weekly_reports WHERE week_start<? AND status='sent' LIMIT 1", start).first());
+    const { results } = await db(env, `SELECT g.user,g.name,g.username,g.submitted,g.points,g.latitude,g.longitude,
+      r.latitude AS target_latitude,r.longitude AS target_longitude FROM guesses g JOIN rounds r ON r.id=g.round
+      WHERE g.submitted>=? AND g.submitted<? ORDER BY g.submitted DESC,g.round DESC`,
+    compare ? start - weekSeconds : start, end).all();
+    await db(env, "INSERT OR IGNORE INTO weekly_reports(week_start,text,status,updated) VALUES(?,?,'pending',?)",
+      start, weeklySummary(results, start, compare), now).run();
+  }
+  const item = await db(env, `UPDATE weekly_reports SET status='sending',updated=? WHERE week_start=?
+    AND status='pending' AND updated<=? RETURNING text`, now, start, now).first();
+  if (!item) return;
+  let message;
+  try {
+    message = await telegram(env, "sendMessage", {
+      chat_id: chat(env), text: item.text, parse_mode: "HTML", link_preview_options: { is_disabled: true },
+    });
+  } catch (error) {
+    const limited = error instanceof ApiFailure && error.status === 429;
+    const rejected = error instanceof ApiFailure && error.status >= 400 && error.status < 500;
+    await db(env, "UPDATE weekly_reports SET status=?,updated=? WHERE week_start=?",
+      limited ? "pending" : rejected ? "failed" : "uncertain", clock() + (limited ? (error.retryAfter || 5) + 1 : 0), start).run();
+    throw error;
+  }
+  await db(env, "UPDATE weekly_reports SET status='sent',message_id=?,updated=? WHERE week_start=?", message.message_id, clock(), start).run();
+}
+
 async function inventory(env) {
   const { locations, done } = await scanLocations(env, { page: "", offset: 0 }, 22);
   const videos = locations.filter((location) => convertibleVideo.has(location.media.mimeType));
@@ -447,6 +545,7 @@ async function tick(env, source) {
   await flush(env);
   const paused = await db(env, "SELECT value FROM settings WHERE key='paused'").first("value");
   if (env.SCHEDULE_ENABLED === "true" && paused !== "1") {
+    await publishWeeklyReport(env, now).catch(logFailure("Weekly report"));
     for (const slot of activeSlots(now)) await publish(env, slot.key, slot.end);
   }
 }
