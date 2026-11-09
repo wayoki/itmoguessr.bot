@@ -32,6 +32,11 @@ const timeLabel = new Intl.DateTimeFormat("ru-RU", {
 });
 const pointWord = { one: "очко", few: "очка", many: "очков", other: "очков" };
 const pointPlural = new Intl.PluralRules("ru");
+const kilometerWord = { one: "километр", few: "километра", many: "километров", other: "километра" };
+const distancePrecision = { maximumFractionDigits: 2 };
+const distanceLabel = new Intl.NumberFormat("ru-RU", distancePrecision);
+const distancePlural = new Intl.PluralRules("ru", distancePrecision);
+const showGuessDetails = (env, roundId) => roundId >= Number(env.PUBLIC_GUESS_SCORE_FROM_ROUND || 1);
 const clock = () => Math.floor(Date.now() / 1000);
 const chat = (env) => env.TELEGRAM_CHANNEL || game.chat;
 const announcementChat = (env) => env.TELEGRAM_ANNOUNCEMENT_CHANNEL || chat(env);
@@ -367,7 +372,7 @@ async function delivery(env, item) {
     return { method: "sendMessage", body: { chat_id: chatId, text: await inventory(env) } };
   }
   if (item.kind === "result") return null;
-  const row = await db(env, `SELECT r.id,r.latitude,r.longitude,g.name,g.username,g.points,
+  const row = await db(env, `SELECT r.id,r.latitude,r.longitude,g.name,g.username,g.points,g.distance,
     g.latitude AS guess_latitude,g.longitude AS guess_longitude,
     EXISTS(SELECT 1 FROM settings WHERE key='correction:' || r.id) AS corrected
     FROM rounds r LEFT JOIN guesses g ON g.round=r.id AND g.user=? WHERE r.id=?`, item.user, item.round).first();
@@ -382,11 +387,15 @@ async function delivery(env, item) {
   let text;
   if (item.kind === "guess") {
     const name = mention(item.user, row.name, row.username);
-    if (item.round < Number(env.PUBLIC_GUESS_SCORE_FROM_ROUND || 1)) {
+    if (!showGuessDetails(env, item.round)) {
       text = `${name} сделал guess в раунде #${item.round}`;
     } else {
-      const points = row.points ?? score(row.guess_latitude, row.guess_longitude, row.latitude, row.longitude).points;
-      text = `${name} набрал ${points} ${pointWord[pointPlural.select(points)]} в раунде #${item.round}`;
+      const fallback = row.points == null || row.distance == null
+        ? score(row.guess_latitude, row.guess_longitude, row.latitude, row.longitude)
+        : null;
+      const points = row.points ?? fallback.points;
+      const km = row.distance ?? fallback.km;
+      text = `${name} набрал ${points} ${pointWord[pointPlural.select(points)]} (дистанция ${distanceLabel.format(km)} км) в раунде #${item.round}`;
     }
   } else {
     const players = (await db(env, "SELECT user,name,username,latitude,longitude,submitted FROM guesses WHERE round=?", item.round).all()).results;
@@ -640,7 +649,10 @@ async function webhook(env, ctx, request) {
     return reply(message, active ? duplicate : expired);
   }
   ctx.waitUntil(flush(env, 1).catch(logFailure("Guess notice")));
-  return reply(message, `${points} / 5000`);
+  const pointsText = `${points} / 5000`;
+  return reply(message, showGuessDetails(env, round.id)
+    ? `${pointsText} (${distanceLabel.format(km)} ${kilometerWord[distancePlural.select(km)]})`
+    : pointsText);
 }
 
 async function mcp(env, request) {

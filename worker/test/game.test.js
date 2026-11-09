@@ -105,12 +105,12 @@ test("webhook enforces secret and accepts a single guess, then reveals once", as
   const point = { location: { latitude: 48.8566, longitude: 2.3522 } };
   const results = await Promise.all([tg(point), tg(point)]);
   const replies = await Promise.all(results.map((result) => result.json()));
-  assert.equal(replies.filter(({ text }) => text === "5000 / 5000").length, 1);
+  assert.equal(replies.filter(({ text }) => text === "5000 / 5000 (0 километров)").length, 1);
   assert.equal(replies.filter(({ text }) => text.includes("использовал")).length, 1);
   await Promise.all(tasks.splice(0));
   assert.equal(sent.length, 1);
   assert.match(sent[0].text, /href="https:\/\/t\.me\/test_player\?profile">&lt;Игрок&gt;<\/a>/);
-  assert.match(sent[0].text, /набрал 5000 очков в раунде #1$/);
+  assert.match(sent[0].text, /набрал 5000 очков \(дистанция 0 км\) в раунде #1$/);
   assert.doesNotMatch(sent[0].text, /48\.8566|2\.3522|maps/);
 
   assert.match((await (await tg({ text: "/close 1" }, 43)).json()).text, /администраторам/);
@@ -292,7 +292,7 @@ test("public guess scores start at the configured round", async (t) => {
   });
   const now = Math.floor(Date.now() / 1000);
   const round = sql.prepare("INSERT INTO rounds VALUES(?,?,?,?,?,?,?,?,?,?)");
-  const guess = sql.prepare("INSERT INTO guesses(round,user,name,latitude,longitude,announcement,submitted,points) VALUES(?,42,'Игрок',48,2,'@club',?,3)");
+  const guess = sql.prepare("INSERT INTO guesses(round,user,name,latitude,longitude,announcement,submitted,points,distance) VALUES(?,42,'Игрок',48,2,'@club',?,3,12.345)");
   for (const id of [4, 5]) {
     round.run(id, `slot:${id}`, `file:${id}`, 48, 2, "@club", now + 3600, id, "active", now);
     guess.run(id, now);
@@ -302,7 +302,7 @@ test("public guess scores start at the configured round", async (t) => {
   }), { DB, BOT_TOKEN: "test-token", MEDIA_PREPARER_KEY: "media-secret", PUBLIC_GUESS_SCORE_FROM_ROUND: "5" }, {});
   assert.equal(response.status, 200);
   assert.match(sent[0], /сделал guess в раунде #4$/);
-  assert.match(sent[1], /набрал 3 очка в раунде #5$/);
+  assert.match(sent[1], /набрал 3 очка \(дистанция 12,35 км\) в раунде #5$/);
   sql.close();
 });
 
