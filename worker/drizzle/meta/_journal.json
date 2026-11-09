@@ -36,6 +36,13 @@
       "when": 1793923204000,
       "tag": "0004_weekly_reports",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1793923205000,
+      "tag": "0005_monthly_reports",
+      "breakpoints": true
     }
   ]
 }

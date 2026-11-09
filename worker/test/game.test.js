@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
-import worker, { activeSlots, coordinates, filenameCoordinates, leaderboard, multipart, resetTestRounds, score, weeklySummary, weeklyWindow } from "../index.js";
+import worker, { activeSlots, coordinates, filenameCoordinates, leaderboard, monthlyWindow, multipart, resetTestRounds, score, weeklySummary, weeklyWindow } from "../index.js";
 
 const clubMigration = "0003_start_club_rounds.sql";
 const applyMigration = (sql, name) => sql.exec(readFileSync(new URL("../drizzle/" + name, import.meta.url), "utf8"));
@@ -15,6 +15,7 @@ function database() {
   }
   applyMigration(sql, clubMigration);
   applyMigration(sql, "0004_weekly_reports.sql");
+  applyMigration(sql, "0005_monthly_reports.sql");
   const DB = {
     prepare(query) {
       return {
@@ -75,6 +76,19 @@ test("weekly report starts Sunday at 9:30 Moscow time and includes all of Saturd
     start: unix("2026-11-08T00:00:00+03:00"), end: unix("2026-11-15T00:00:00+03:00"),
   });
   assert.equal(weeklyWindow(unix("2026-11-16T09:30:00+03:00")), null);
+  assert.equal(weeklyWindow(unix("2026-12-06T09:30:00+03:00")), null);
+  assert.notEqual(weeklyWindow(unix("2026-12-13T09:30:00+03:00")), null);
+});
+
+test("monthly report starts on the first at 9:30 Moscow time and replaces the first Sunday report", () => {
+  const unix = (date) => Date.parse(date) / 1000;
+  assert.equal(monthlyWindow(unix("2026-12-01T09:29:59+03:00")), null);
+  assert.deepEqual(monthlyWindow(unix("2026-12-01T09:30:00+03:00")), {
+    start: unix("2026-11-01T00:00:00+03:00"), end: unix("2026-12-01T00:00:00+03:00"),
+  });
+  assert.equal(monthlyWindow(unix("2026-12-02T09:30:00+03:00")), null);
+  assert.notEqual(monthlyWindow(unix("2026-11-01T09:30:00+03:00")), null);
+  assert.equal(weeklyWindow(unix("2026-11-01T09:30:00+03:00")), null);
 });
 
 test("weekly top three ranks activity, mean score and percentage improvement", () => {
@@ -90,12 +104,15 @@ test("weekly top three ranks activity, mean score and percentage improvement", (
     { user: 2, name: "Точный", submitted: 99, points: 3000 },
     { user: 3, name: "Третий", submitted: 99, points: 0 },
   ];
-  const [, activity, accuracy, progress] = weeklySummary(rows, 100, true).split("\n\n");
+  const { text, mentions } = weeklySummary(rows, 100, true);
+  const [, activity, accuracy, progress] = text.split("\n\n");
   assert.match(activity, /1\. .*&lt;Первый&gt;.*\(3 сыгранных раунда за неделю\)/);
   assert.match(accuracy, /1\. .*Точный.*\(4\s500 очков в среднем\)/);
   assert.match(progress, /1\. .*&lt;Первый&gt;.*на 100%\)\n2\. .*Точный.*на 50%\)$/);
   for (const section of [activity, accuracy]) assert.equal(section.split("\n").length, 4);
-  assert.doesNotMatch(weeklySummary(rows, 100, false), /Самые прогрессирующие/);
+  assert.equal(mentions.length, 8);
+  assert.equal(mentions.filter(({ user }) => user === 1).length, 3);
+  assert.doesNotMatch(weeklySummary(rows, 100, false).text, /Самые прогрессирующие/);
 });
 
 test("multipart uses Telegram-safe names, inline round ID and no answer coordinates", () => {
@@ -342,6 +359,52 @@ test("Sunday schedule publishes the previous week's report once", async (t) => {
   assert.match(sent[0].text, /Итоги недели!.*Суббота/s);
   assert.doesNotMatch(sent[0].text, /Воскресенье|Самые прогрессирующие/);
   assert.equal(sql.prepare("SELECT message_id FROM weekly_reports WHERE status='sent'").get().message_id, 111);
+  const stored = sql.prepare("SELECT mentions FROM weekly_reports").get();
+  assert.deepEqual(JSON.parse(stored.mentions).map(({ user }) => user), [42, 42]);
+  sql.close();
+});
+
+test("first-of-month schedule uses all month scores and published weekly mentions without duplicates", async (t) => {
+  const { sql, DB } = database();
+  const sent = [];
+  const unix = (date) => Date.parse(date) / 1000;
+  t.mock.method(Date, "now", () => Date.parse("2026-12-01T09:30:00+03:00"));
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    assert.match(url, /\/sendMessage$/);
+    sent.push(JSON.parse(options.body));
+    return Response.json({ ok: true, result: { message_id: 112 } });
+  });
+  const player = { user: 42, name: "Макс", username: "test_player" };
+  const other = { user: 43, name: "Вне месяца" };
+  const round = sql.prepare("INSERT INTO rounds VALUES(?,?,?,?,?,?,?,?,?,?)");
+  const guess = sql.prepare("INSERT INTO guesses(round,user,name,username,latitude,longitude,announcement,submitted,points) VALUES(?,?,?,?,48,2,'@club',?,?)");
+  for (const [index, date, points] of [
+    [1, "2026-11-07T12:00:00+03:00", 2000],
+    [2, "2026-11-15T12:00:00+03:00", 4000],
+    [3, "2026-11-30T12:00:00+03:00", 3000],
+    [4, "2026-12-01T00:00:00+03:00", 5000],
+  ]) {
+    const at = unix(date);
+    round.run(index, `slot:${index}`, `file:${index}`, 48, 2, "@club", at, index, "closed", at);
+    guess.run(index, player.user, player.name, player.username, at, points);
+  }
+  sql.exec("UPDATE outbox SET status='sent'");
+  const report = sql.prepare("INSERT INTO weekly_reports(week_start,text,mentions,status,updated) VALUES(?,'old',?,?,?)");
+  report.run(1, JSON.stringify([player, player]), "sent", unix("2026-11-15T09:30:00+03:00"));
+  report.run(2, JSON.stringify([player]), "sent", unix("2026-11-22T09:30:00+03:00"));
+  report.run(3, JSON.stringify([other]), "pending", unix("2026-11-29T09:30:00+03:00"));
+  report.run(4, JSON.stringify([other]), "sent", unix("2026-12-01T00:00:00+03:00"));
+  const env = { DB, BOT_TOKEN: "test-token", TELEGRAM_CHANNEL: "@club", MEDIA_PREPARER_KEY: "secret", SCHEDULE_ENABLED: "true" };
+  const wake = () => worker.fetch(new Request("https://bot.example/media/wake", {
+    method: "POST", headers: { "X-ITMOGUESSR-Media-Key": "secret" },
+  }), env, {});
+  assert.equal((await wake()).status, 200);
+  assert.equal((await wake()).status, 200);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].chat_id, "@club");
+  assert.match(sent[0].text, /Итоги месяца!.*3 сыгранных раунда за месяц.*3\s000 очков в среднем.*улучшил показатели на 50%.*Самые отметившиеся.*test_player\?profile">Макс<\/a> — 3 упоминания/s);
+  assert.doesNotMatch(sent[0].text, /Вне месяца/);
+  assert.equal(sql.prepare("SELECT message_id FROM monthly_reports WHERE status='sent'").get().message_id, 112);
   sql.close();
 });
 

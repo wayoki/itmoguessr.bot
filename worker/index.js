@@ -4,7 +4,7 @@ const game = {
   drive: "1rlP26NNEgdsHkv1n1QGo9SAkaT6aCady",
   timezone: "Europe/Moscow",
   manualMinutes: 120,
-  weeklyPublish: "09:30",
+  reportTime: "09:30",
   slots: [
     { name: "morning", publish: "10:00", reveal: "19:00" },
     { name: "evening", publish: "20:00", reveal: "09:00" },
@@ -93,8 +93,18 @@ export function activeSlots(now) {
 export function weeklyWindow(now) {
   const local = parts(now);
   const today = Date.UTC(+local.year, +local.month - 1, +local.day) / 1000;
-  if (new Date(today * 1000).getUTCDay() !== 0 || now < localEpoch(today, game.weeklyPublish)) return null;
+  // The first Sunday is the report slot replaced by the monthly post.
+  if (+local.day <= 7 || new Date(today * 1000).getUTCDay() !== 0 || now < localEpoch(today, game.reportTime)) return null;
   return { start: localEpoch(today - weekSeconds, "00:00"), end: localEpoch(today, "00:00") };
+}
+
+export function monthlyWindow(now) {
+  const local = parts(now);
+  if (+local.day !== 1) return null;
+  const today = Date.UTC(+local.year, +local.month - 1, 1) / 1000;
+  if (now < localEpoch(today, game.reportTime)) return null;
+  const priorMonth = Date.UTC(+local.year, +local.month - 2, 1) / 1000;
+  return { start: localEpoch(priorMonth, "00:00"), end: localEpoch(today, "00:00") };
 }
 
 class ApiFailure extends Error {
@@ -366,77 +376,130 @@ export function leaderboard(round, players) {
   return top.length ? [heading, "", ...lines].join("\n") : heading;
 }
 
-const weeklyNumber = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 1 });
-const weeklyPlural = new Intl.PluralRules("ru", { maximumFractionDigits: 1 });
+const reportNumber = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 1 });
+const reportPlural = new Intl.PluralRules("ru", { maximumFractionDigits: 1 });
 const playedRoundWord = { one: "сыгранный раунд", few: "сыгранных раунда", many: "сыгранных раундов", other: "сыгранных раундов" };
+const mentionWord = { one: "упоминание", few: "упоминания", many: "упоминаний", other: "упоминаний" };
 
-export function weeklySummary(rows, start, compare) {
-  const current = new Map();
-  const previous = new Map();
+function playerStats(rows) {
+  const players = new Map();
   for (const row of rows) {
-    const week = row.submitted >= start ? current : previous;
-    if (!week.has(row.user)) {
-      week.set(row.user, { user: row.user, name: row.name, username: row.username, rounds: 0, total: 0 });
+    if (!players.has(row.user)) {
+      players.set(row.user, { user: row.user, name: row.name, username: row.username, rounds: 0, total: 0 });
     }
-    const player = week.get(row.user);
+    const player = players.get(row.user);
     player.rounds++;
     player.total += row.points ?? score(row.latitude, row.longitude, row.target_latitude, row.target_longitude).points;
   }
-  const title = "<b>Итоги недели!</b>";
-  if (!current.size) return `${title}\n\nЗа неделю никто не сыграл.`;
-  const average = (player) => player.total / player.rounds;
-  const byActivity = (a, b) => b.rounds - a.rounds || average(b) - average(a) || a.user - b.user;
-  const byAccuracy = (a, b) => average(b) - average(a) || b.rounds - a.rounds || a.user - b.user;
-  const section = (heading, players, detail) => [
-    `<b>${heading}:</b>`,
-    ...players.slice(0, 3).map((player, index) =>
-      `${index + 1}. ${mention(player.user, player.name, player.username)} (${detail(player)})`),
-  ].join("\n");
-  const players = [...current.values()];
-  const sections = [
-    title,
-    section("Самые активные", players.toSorted(byActivity),
-      ({ rounds }) => `${rounds} ${playedRoundWord[pointPlural.select(rounds)]} за неделю`),
-    section("Самые точные", players.toSorted(byAccuracy), (player) => {
+  return players;
+}
+
+const average = (player) => player.total / player.rounds;
+const byActivity = (a, b) => b.rounds - a.rounds || average(b) - average(a) || a.user - b.user;
+const byAccuracy = (a, b) => average(b) - average(a) || b.rounds - a.rounds || a.user - b.user;
+
+function reportSection(heading, players, detail, mentions, empty) {
+  const lines = players.slice(0, 3).map((player, index) => {
+    const { user, name, username } = player;
+    mentions?.push({ user, name, username });
+    return `${index + 1}. ${mention(user, name, username)} ${detail(player)}`;
+  });
+  return [`<b>${heading}:</b>`, ...(lines.length ? lines : [empty])].join("\n");
+}
+
+function activityAndAccuracy(stats, period, mentions) {
+  const players = [...stats.values()];
+  return [
+    reportSection("Самые активные", players.toSorted(byActivity),
+      ({ rounds }) => `(${rounds} ${playedRoundWord[pointPlural.select(rounds)]} за ${period})`, mentions),
+    reportSection("Самые точные", players.toSorted(byAccuracy), (player) => {
       const avg = average(player);
-      return `${weeklyNumber.format(avg)} ${pointWord[weeklyPlural.select(avg)]} в среднем`;
-    }),
+      return `(${reportNumber.format(avg)} ${pointWord[reportPlural.select(avg)]} в среднем)`;
+    }, mentions),
   ];
-  if (compare) {
-    const progress = players.flatMap((player) => {
-      const prior = previous.get(player.user);
-      if (!prior || prior.total === 0 || average(player) <= average(prior)) return [];
-      return [{ ...player, improvement: 100 * (average(player) - average(prior)) / average(prior) }];
-    }).sort((a, b) => b.improvement - a.improvement || byAccuracy(a, b));
-    sections.push(progress.length
-      ? section("Самые прогрессирующие", progress, ({ improvement }) =>
-        `улучшил показатели на ${weeklyNumber.format(improvement) === "0" ? "&lt;0,1" : weeklyNumber.format(improvement)}%`)
-      : "<b>Самые прогрессирующие:</b>\nПока нет участников с ростом среднего результата за обе недели.");
+}
+
+function progressSection(current, previous, mentions) {
+  const ranked = [...current.values()].flatMap((player) => {
+    const prior = previous.get(player.user);
+    if (!prior || prior.total === 0 || average(player) <= average(prior)) return [];
+    return [{ ...player, improvement: 100 * (average(player) - average(prior)) / average(prior) }];
+  }).sort((a, b) => b.improvement - a.improvement || byAccuracy(a, b));
+  return reportSection("Самые прогрессирующие", ranked, ({ improvement }) => {
+    const percent = reportNumber.format(improvement);
+    return `(улучшил показатели на ${percent === "0" ? "&lt;0,1" : percent}%)`;
+  }, mentions, "Пока нет участников с ростом среднего результата за обе недели.");
+}
+
+export function weeklySummary(rows, start, compare) {
+  const current = playerStats(rows.filter((row) => row.submitted >= start));
+  const title = "<b>Итоги недели!</b>";
+  const mentions = [];
+  if (!current.size) return { text: `${title}\n\nЗа неделю никто не сыграл.`, mentions };
+  const sections = [title, ...activityAndAccuracy(current, "неделю", mentions)];
+  if (compare) sections.push(progressSection(current, playerStats(rows.filter((row) => row.submitted < start)), mentions));
+  return { text: sections.join("\n\n"), mentions };
+}
+
+export function monthlySummary(rows, mentions, start, end) {
+  const players = playerStats(rows);
+  const mostMentioned = new Map();
+  for (const entry of mentions) {
+    if (!mostMentioned.has(entry.user)) mostMentioned.set(entry.user, { ...entry, count: 0 });
+    mostMentioned.get(entry.user).count++;
   }
+  const ranked = [...mostMentioned.values()].sort((a, b) => b.count - a.count || a.user - b.user);
+  const sections = ["<b>Итоги месяца!</b>"];
+  if (players.size) {
+    const firstWeek = playerStats(rows.filter((row) => row.submitted < start + weekSeconds));
+    const lastWeek = playerStats(rows.filter((row) => row.submitted >= end - weekSeconds));
+    sections.push(...activityAndAccuracy(players, "месяц"), progressSection(lastWeek, firstWeek));
+  } else {
+    sections.push("За месяц никто не сыграл.");
+  }
+  sections.push(reportSection("Самые отметившиеся", ranked,
+    ({ count }) => `— ${count} ${mentionWord[pointPlural.select(count)]}`, undefined, "За месяц упоминаний в недельных итогах пока нет."));
   return sections.join("\n\n");
 }
 
-async function publishWeeklyReport(env, now) {
-  const window = weeklyWindow(now);
+async function reportGuesses(env, start, end) {
+  const { results } = await db(env, `SELECT g.user,g.name,g.username,g.submitted,g.points,g.latitude,g.longitude,
+    r.latitude AS target_latitude,r.longitude AS target_longitude FROM guesses g JOIN rounds r ON r.id=g.round
+    WHERE g.submitted>=? AND g.submitted<? ORDER BY g.submitted DESC,g.round DESC`, start, end).all();
+  return results;
+}
+
+async function prepareWeeklyReport(env, start, end, now) {
+  const compare = Boolean(await db(env, "SELECT 1 FROM weekly_reports WHERE week_start<? AND status='sent' LIMIT 1", start).first());
+  const rows = await reportGuesses(env, compare ? start - weekSeconds : start, end);
+  const { text, mentions } = weeklySummary(rows, start, compare);
+  await db(env, "INSERT OR IGNORE INTO weekly_reports(week_start,text,mentions,status,updated) VALUES(?,?,?,'pending',?)",
+    start, text, JSON.stringify(mentions), now).run();
+}
+
+async function prepareMonthlyReport(env, start, end, now) {
+  const [rows, reports] = await Promise.all([
+    reportGuesses(env, start, end),
+    db(env, "SELECT mentions FROM weekly_reports WHERE status='sent' AND updated>=? AND updated<? ORDER BY updated DESC",
+      start, end).all(),
+  ]);
+  const mentions = reports.results.flatMap((report) => JSON.parse(report.mentions));
+  await db(env, "INSERT OR IGNORE INTO monthly_reports(month_start,text,status,updated) VALUES(?,?,'pending',?)",
+    start, monthlySummary(rows, mentions, start, end), now).run();
+}
+
+async function publishReport(env, now, window, table, key, prepare) {
   if (!window) return;
   const { start, end } = window;
-  const existing = await db(env, "SELECT status,updated FROM weekly_reports WHERE week_start=?", start).first();
+  const existing = await db(env, `SELECT status,updated FROM ${table} WHERE ${key}=?`, start).first();
   if (existing?.status === "sending" && existing.updated < now - 180) {
-    await db(env, "UPDATE weekly_reports SET status='uncertain' WHERE week_start=? AND status='sending' AND updated<?",
+    await db(env, `UPDATE ${table} SET status='uncertain' WHERE ${key}=? AND status='sending' AND updated<?`,
       start, now - 180).run();
     return;
   }
   if (existing && existing.status !== "pending") return;
-  if (!existing) {
-    const compare = Boolean(await db(env, "SELECT 1 FROM weekly_reports WHERE week_start<? AND status='sent' LIMIT 1", start).first());
-    const { results } = await db(env, `SELECT g.user,g.name,g.username,g.submitted,g.points,g.latitude,g.longitude,
-      r.latitude AS target_latitude,r.longitude AS target_longitude FROM guesses g JOIN rounds r ON r.id=g.round
-      WHERE g.submitted>=? AND g.submitted<? ORDER BY g.submitted DESC,g.round DESC`,
-    compare ? start - weekSeconds : start, end).all();
-    await db(env, "INSERT OR IGNORE INTO weekly_reports(week_start,text,status,updated) VALUES(?,?,'pending',?)",
-      start, weeklySummary(results, start, compare), now).run();
-  }
-  const item = await db(env, `UPDATE weekly_reports SET status='sending',updated=? WHERE week_start=?
+  if (!existing) await prepare(env, start, end, now);
+  const item = await db(env, `UPDATE ${table} SET status='sending',updated=? WHERE ${key}=?
     AND status='pending' AND updated<=? RETURNING text`, now, start, now).first();
   if (!item) return;
   let message;
@@ -447,11 +510,11 @@ async function publishWeeklyReport(env, now) {
   } catch (error) {
     const limited = error instanceof ApiFailure && error.status === 429;
     const rejected = error instanceof ApiFailure && error.status >= 400 && error.status < 500;
-    await db(env, "UPDATE weekly_reports SET status=?,updated=? WHERE week_start=?",
+    await db(env, `UPDATE ${table} SET status=?,updated=? WHERE ${key}=?`,
       limited ? "pending" : rejected ? "failed" : "uncertain", clock() + (limited ? (error.retryAfter || 5) + 1 : 0), start).run();
     throw error;
   }
-  await db(env, "UPDATE weekly_reports SET status='sent',message_id=?,updated=? WHERE week_start=?", message.message_id, clock(), start).run();
+  await db(env, `UPDATE ${table} SET status='sent',message_id=?,updated=? WHERE ${key}=?`, message.message_id, clock(), start).run();
 }
 
 async function inventory(env) {
@@ -545,7 +608,8 @@ async function tick(env, source) {
   await flush(env);
   const paused = await db(env, "SELECT value FROM settings WHERE key='paused'").first("value");
   if (env.SCHEDULE_ENABLED === "true" && paused !== "1") {
-    await publishWeeklyReport(env, now).catch(logFailure("Weekly report"));
+    await publishReport(env, now, monthlyWindow(now), "monthly_reports", "month_start", prepareMonthlyReport).catch(logFailure("Monthly report"));
+    await publishReport(env, now, weeklyWindow(now), "weekly_reports", "week_start", prepareWeeklyReport).catch(logFailure("Weekly report"));
     for (const slot of activeSlots(now)) await publish(env, slot.key, slot.end);
   }
 }
