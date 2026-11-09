@@ -4,7 +4,7 @@ const game = {
   drive: "1rlP26NNEgdsHkv1n1QGo9SAkaT6aCady",
   timezone: "Europe/Moscow",
   manualMinutes: 120,
-  weeklyPublish: "08:30",
+  weeklyPublish: "09:30",
   slots: [
     { name: "morning", publish: "10:00", reveal: "19:00" },
     { name: "evening", publish: "20:00", reveal: "09:00" },

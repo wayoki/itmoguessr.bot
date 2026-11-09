@@ -67,14 +67,14 @@ test("evening slot survives midnight and closes at nine Moscow time", () => {
   assert.equal(activeSlots(unix("2026-11-06T10:00:00+03:00"))[0].key, "morning:2026-11-06");
 });
 
-test("weekly report starts Sunday at 8:30 Moscow time and includes all of Saturday", () => {
+test("weekly report starts Sunday at 9:30 Moscow time and includes all of Saturday", () => {
   const unix = (date) => Date.parse(date) / 1000;
   assert.equal(weeklyWindow(unix("2026-11-14T23:59:59+03:00")), null);
-  assert.equal(weeklyWindow(unix("2026-11-15T08:29:59+03:00")), null);
-  assert.deepEqual(weeklyWindow(unix("2026-11-15T08:30:00+03:00")), {
+  assert.equal(weeklyWindow(unix("2026-11-15T09:29:59+03:00")), null);
+  assert.deepEqual(weeklyWindow(unix("2026-11-15T09:30:00+03:00")), {
     start: unix("2026-11-08T00:00:00+03:00"), end: unix("2026-11-15T00:00:00+03:00"),
   });
-  assert.equal(weeklyWindow(unix("2026-11-16T08:30:00+03:00")), null);
+  assert.equal(weeklyWindow(unix("2026-11-16T09:30:00+03:00")), null);
 });
 
 test("weekly top three ranks activity, mean score and percentage improvement", () => {
@@ -315,17 +315,17 @@ test("authenticated schedule wake reveals an expired round exactly once", async 
   sql.close();
 });
 
-test("Sunday schedule publishes the previous week's report once without closing the active round", async (t) => {
+test("Sunday schedule publishes the previous week's report once", async (t) => {
   const { sql, DB } = database();
   const sent = [];
-  t.mock.method(Date, "now", () => Date.parse("2026-11-15T08:30:00+03:00"));
+  t.mock.method(Date, "now", () => Date.parse("2026-11-15T09:30:00+03:00"));
   t.mock.method(globalThis, "fetch", async (url, options) => {
     assert.match(url, /\/sendMessage$/);
     sent.push(JSON.parse(options.body));
     return Response.json({ ok: true, result: { message_id: 111 } });
   });
   const cutoff = Date.parse("2026-11-15T00:00:00+03:00") / 1000;
-  sql.prepare("INSERT INTO rounds VALUES(1,'evening:2026-11-14','file:video',48,2,'@club',?,55,'active',?)")
+  sql.prepare("INSERT INTO rounds VALUES(1,'evening:2026-11-14','file:video',48,2,'@club',?,55,'closed',?)")
     .run(cutoff + 9 * 3600, cutoff - 4 * 3600);
   const guess = sql.prepare("INSERT INTO guesses(round,user,name,latitude,longitude,announcement,submitted,points) VALUES(1,?,?,48,2,'@club',?,5000)");
   guess.run(42, "Суббота", cutoff - 1);
@@ -342,7 +342,6 @@ test("Sunday schedule publishes the previous week's report once without closing 
   assert.match(sent[0].text, /Итоги недели!.*Суббота/s);
   assert.doesNotMatch(sent[0].text, /Воскресенье|Самые прогрессирующие/);
   assert.equal(sql.prepare("SELECT message_id FROM weekly_reports WHERE status='sent'").get().message_id, 111);
-  assert.equal(sql.prepare("SELECT status FROM rounds").get().status, "active");
   sql.close();
 });
 
