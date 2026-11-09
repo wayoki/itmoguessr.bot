@@ -30,6 +30,8 @@ const dateParts = new Intl.DateTimeFormat("en-CA", {
 const timeLabel = new Intl.DateTimeFormat("ru-RU", {
   timeZone: game.timezone, day: "numeric", month: "numeric", hour: "2-digit", minute: "2-digit",
 });
+const pointWord = { one: "очко", few: "очка", many: "очков", other: "очков" };
+const pointPlural = new Intl.PluralRules("ru");
 const clock = () => Math.floor(Date.now() / 1000);
 const chat = (env) => env.TELEGRAM_CHANNEL || game.chat;
 const announcementChat = (env) => env.TELEGRAM_ANNOUNCEMENT_CHANNEL || chat(env);
@@ -365,7 +367,8 @@ async function delivery(env, item) {
     return { method: "sendMessage", body: { chat_id: chatId, text: await inventory(env) } };
   }
   if (item.kind === "result") return null;
-  const row = await db(env, `SELECT r.id,r.latitude,r.longitude,g.name,g.username,
+  const row = await db(env, `SELECT r.id,r.latitude,r.longitude,g.name,g.username,g.points,
+    g.latitude AS guess_latitude,g.longitude AS guess_longitude,
     EXISTS(SELECT 1 FROM settings WHERE key='correction:' || r.id) AS corrected
     FROM rounds r LEFT JOIN guesses g ON g.round=r.id AND g.user=? WHERE r.id=?`, item.user, item.round).first();
   const maps = googleMaps(row.latitude, row.longitude);
@@ -378,7 +381,13 @@ async function delivery(env, item) {
 
   let text;
   if (item.kind === "guess") {
-    text = `${mention(item.user, row.name, row.username)} сделал guess в раунде #${item.round}`;
+    const name = mention(item.user, row.name, row.username);
+    if (item.round < Number(env.PUBLIC_GUESS_SCORE_FROM_ROUND || 1)) {
+      text = `${name} сделал guess в раунде #${item.round}`;
+    } else {
+      const points = row.points ?? score(row.guess_latitude, row.guess_longitude, row.latitude, row.longitude).points;
+      text = `${name} набрал ${points} ${pointWord[pointPlural.select(points)]} в раунде #${item.round}`;
+    }
   } else {
     const players = (await db(env, "SELECT user,name,username,latitude,longitude,submitted FROM guesses WHERE round=?", item.round).all()).results;
     text = leaderboard(row, players);
