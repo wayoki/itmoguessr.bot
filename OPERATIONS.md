@@ -1,28 +1,34 @@
 # Operations
 
-GitHub stores the current Worker source, migrations, tests and maintenance jobs.
-The existing Sites deployment keeps the Telegram webhook, D1 game data and private R2 media.
-Actions does not replace these persistent services. Player data and videos must never be committed or uploaded as public workflow artifacts.
+## Hosting
+GitHub contains the current bot source, database migrations, tests and maintenance jobs.
+The existing Sites deployment serves Telegram webhooks and retains D1 game data and private R2 media.
+Player data and video files are never committed or uploaded as public workflow artifacts.
+Actions builds and tests Worker source; changes to the Worker itself still require an authenticated Sites deployment.
 
-## Jobs
+## Actions
+- Tests and build: 30 game tests, 5 scheduler/video tests and a self-contained Worker build.
+- Verify bot access: manual authenticated access check with no Telegram publication.
+- Check training schedule: minutes 2, 7, 12, …, 57 of every hour; checks due rounds and weekly/monthly reports. Game times remain in Europe/Moscow.
+- Prepare Telegram videos: minutes 7, 22, 37 and 52; FFmpeg converts up to two queued Drive videos and saves outputs to private R2. Temporary runner files disappear with the job.
+- Verify Actions cutover: authenticated access, real queue processing and a due-round check. Runs manually, or when its own workflow configuration changes on main.
 
-- `Tests and build`: runs game tests, scheduler tests and a self-contained Worker build on pushes and pull requests. It never calls production.
-- `Verify bot access`: manually checks authenticated media access without publishing Telegram messages.
-- `Check training schedule`: checks due rounds and weekly/monthly reports every five minutes, at minutes 2, 7, 12, and so on. Game times remain in Europe/Moscow. Actions can start late and public repositories disable schedules after 60 days without repository activity.
-- `Prepare Telegram videos`: runs FFmpeg every 15 minutes; downloads and encoded files exist only in the runner's temporary storage. Prepared media is uploaded to the existing private R2 bucket.
+GitHub can delay scheduled runs. Public-repository schedules are disabled after 60 days without repository activity.
 
-## Required secret and cutover
+## Credentials
+The repository secret ITMOGUESSR_MEDIA_KEY must match MEDIA_PREPARER_KEY in the bot's Sites runtime.
+Neither value belongs in source files or workflow logs. Telegram and Drive credentials remain in Sites.
+Without the secret, scheduled jobs report that maintenance is inactive and make no production calls.
+Manual jobs fail explicitly if credentials are absent.
 
-Create the repository secret `ITMOGUESSR_MEDIA_KEY` with the same value as `MEDIA_PREPARER_KEY` in the existing bot's Sites runtime. Do not put this value in a file, workflow, issue or chat. The Telegram token and Drive service-account credentials remain in Sites and are not needed by these jobs.
+## Migration record — 21 November 2026
+- End-to-end Actions verification passed: https://github.com/wayoki/itmoguessr.bot/actions/runs/44932355775
+- Private media access and due-round checks succeeded; the video queue contained no files requiring conversion.
+- The Render media service itmoguessr-media is suspended.
+- MEDIA_WORKER_URL was removed from the Sites runtime and version 23 was redeployed with environment revision 12.
+- The old Apps Script scheduledCheck function now returns immediately. Its trigger and original source are retained for reversible recovery, and do not call the bot.
+- The old ChatGPT scheduling automation was already disabled and remains disabled.
+- Database contents, pause state and Telegram webhook were preserved.
 
-Scheduled jobs perform no production requests when the secret is absent. A manual run fails explicitly when configuration is missing.
-
-1. Add the secret, then run `Verify bot access`.
-2. Run `Prepare Telegram videos` and `Check training schedule`; confirm both succeed.
-3. Remove `MEDIA_WORKER_URL` from the Sites runtime and redeploy the current saved version, preserving all other environment variables. This stops the old Apps Script path from waking Render.
-4. Remove only the `scheduledCheck` time trigger in the existing Apps Script project after a successful scheduled Actions run is observed.
-5. Suspend the old Render media service. Do not delete it before the new workflow is verified.
-
-Until these steps are complete, the existing scheduler and Render service are the fallback. The database, Telegram webhook and existing rounds must not be reset.
-
-The GitHub workflows build and test the Worker; they do not automatically deploy Worker source to Sites. Publishing a Worker change still uses the authenticated Sites deployment workflow.
+If recovering the old Render pipeline, resume the service, update its media-key digest to match the current key, and restore MEDIA_WORKER_URL.
+Re-enabling the old Apps Script scheduler requires removing the early return in scheduledCheck. Do not re-enable it during normal Actions operation.
