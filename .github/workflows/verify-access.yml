@@ -1,0 +1,25 @@
+name: Verify bot access
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify credentials without publishing messages
+        env:
+          ITMOGUESSR_MEDIA_ORIGIN: https://itmoguessr-training-bot.handydandelion1.chatgpt.site
+          ITMOGUESSR_MEDIA_KEY: ${{ secrets.ITMOGUESSR_MEDIA_KEY }}
+        run: python scripts/check_schedule.py --verify
+
