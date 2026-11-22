@@ -13,6 +13,9 @@ function runGoogleBot_(name, event) {
 }
 function installGoogleBot() { return runGoogleBot_('installGoogleBot'); }
 function verifyGoogleBot() { return runGoogleBot_('verifyGoogleBot'); }
-function scheduledCheck() { return runGoogleBot_('scheduledCheck'); }
+function scheduledCheck() {
+  const fields = Utilities.formatDate(new Date(), 'Europe/Moscow', 'H:m').split(':').map(Number);
+  if (([9, 10, 19, 20].includes(fields[0]) && fields[1] < 10) || fields[1] % 5 === 0) return runGoogleBot_('scheduledCheck');
+}
 function doGet(event) { return runGoogleBot_('doGet', event); }
 function doPost(event) { return runGoogleBot_('doPost', event); }
