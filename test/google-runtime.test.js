@@ -1,12 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
+import { readFile } from 'node:fs/promises';
 import { buildGoogle } from '../scripts/build-google.js';
 
 const build = await buildGoogle();
 const context = vm.createContext({ console: { log() {}, warn() {}, error() {} } });
 vm.runInContext(build.sqlBundle + '\n' + build.bundle, context);
 const SQL = context.loadGoogleSqlite();
+const migrationSource = await readFile('google/migration.gs', 'utf8');
 
 function fixture() {
   const sent = [];
@@ -99,4 +101,46 @@ test('Google transformed webhook still denies unauthorized requests and owners',
   const reply = core.webhook(env, { waitUntil() {} }, request({ ...owner(1, { text: '/add' }), from: { id: 99 } }));
   assert.match(reply.data.text, /владельцу/);
   sqlite.close();
+});
+
+test('migration preserves Telegram IDs and notifications without executing import triggers', () => {
+  const source = fixture(), destination = fixture();
+  const ctx = { waitUntil: value => value };
+  for (const message of [source.owner(1, { text: '/add' }), source.owner(2, { video: { file_id: 'persistent-telegram-video', file_unique_id: 'persistent-unique' } }),
+    source.owner(3, { text: '55.75, 37.61' }), source.owner(4, { text: '4500' })]) source.core.webhook(source.env, ctx, source.request(message));
+  source.core.publish(source.env, 'manual:migration', Math.floor(Date.now() / 1000) + 300);
+  const names = ['rounds','guesses','selected','settings','outbox','prepared_media','retired_locations','weekly_reports','monthly_reports','locations','location_upload_sessions'];
+  const data = { version: 1, env: { BOT_TOKEN: 'private-test-token', WEBHOOK_SECRET: 'private-test-secret' },
+    tables: Object.fromEntries(names.map(name => [name, source.env.DB.prepare('SELECT * FROM ' + name).all().results])) };
+  const properties = {};
+  let persisted = 0;
+  const sandbox = vm.createContext({ console, Date, PropertiesService: { getScriptProperties: () => ({ getProperty: key => properties[key], setProperties: values => Object.assign(properties, values) }) },
+    withGoogleRuntime_: action => action({ sqlite: destination.sqlite, env: { DATA_FOLDER_ID: 'private' }, persist() { persisted++; } }),
+    driveCreate_() {}, Utilities: { base64Encode: () => 'private-test-backup' }, bytesSigned_: x => x,
+  });
+  vm.runInContext(migrationSource, sandbox);
+  sandbox.migrateSource_ = () => data;
+  const result = vm.runInContext('migrateImport_()', sandbox);
+  assert.equal(result.counts.rounds, 1);
+  assert.equal(destination.env.DB.prepare('SELECT file_id FROM locations').first('file_id'), 'persistent-telegram-video');
+  assert.equal(destination.env.DB.prepare('SELECT COUNT(*) AS n FROM outbox').first('n'), data.tables.outbox.length);
+  assert.equal(destination.env.DB.prepare("SELECT value FROM settings WHERE key='paused'").first('value'), '1');
+  assert.equal(properties.BOT_TOKEN, 'private-test-token');
+  assert.ok(!JSON.stringify(result).includes('private-test-token'));
+  assert.equal(persisted, 1);
+  data.tables.locations[0].unexpected_column = 'reject';
+  assert.throws(() => vm.runInContext('migrateImport_()', sandbox), /UnexpectedColumn/);
+  assert.equal(persisted, 1);
+  assert.equal(destination.env.DB.prepare('SELECT file_id FROM locations').first('file_id'), 'persistent-telegram-video');
+  properties.GOOGLE_BOT_ACTIVE = 'true';
+  assert.throws(() => vm.runInContext('migrateImport_()', sandbox), /AlreadyActive/);
+  source.sqlite.close(); destination.sqlite.close();
+});
+
+test('Telegram acknowledgement uses a direct HTML response rather than a content redirect', async () => {
+  const sandbox = vm.createContext({ HtmlService: { createHtmlOutput: value => ({ http: 200, body: value }) } });
+  vm.runInContext(await readFile('google/bootstrap.gs', 'utf8'), sandbox);
+  const ack = vm.runInContext('telegramAck_()', sandbox);
+  assert.equal(ack.http, 200);
+  assert.equal(ack.body, 'OK');
 });

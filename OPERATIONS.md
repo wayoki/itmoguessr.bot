@@ -52,3 +52,7 @@ These checks verify timer connectivity and code paths; the next actual scheduled
 ### Telegram uploads (target Google runtime)
 
 The owner uses /add → one Telegram video → coordinates → own score (0–5000), then /done. Files stay in Telegram and are reused by file_id. Google persists only SQLite game data and runtime code. MEDIA_SOURCE is forced to telegram in the Google adapter, including when legacy Drive credentials are present. The target runtime has no source/prepared-video upload endpoints. The live Sites runtime remains in service until data migration and a verified Google cutover.
+
+### Google staging installed — 22 November 2026
+
+The Google runtime and private SQLite storage were installed successfully in the existing Apps Script project. Drive API v3 is enabled; runtime remains inactive and no Telegram webhook cutover has occurred. The public incoming webapp address requires explicit owner approval before deployment. Migration source export/freeze, destination import with rollback, and notification preservation have been prepared and tested. GitHub CI for commit 389cc526ee3e3200296f2ff80b98b21e61795123 succeeded. No production data or tokens are in the public repository.

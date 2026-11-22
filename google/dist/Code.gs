@@ -98,10 +98,13 @@ function verifyGoogleBot() {
 }
 function scheduledCheck() {
   if (PropertiesService.getScriptProperties().getProperty('GOOGLE_BOT_ACTIVE') !== 'true') return;
+  const fields = Utilities.formatDate(new Date(), 'Europe/Moscow', 'H:m').split(':').map(Number);
+  if (!(([9,10,19,20].includes(fields[0]) && fields[1] < 10) || fields[1] % 5 === 0)) return;
   return withGoogleRuntime_(runtime => runtime.core.tick(runtime.env, 'apps_script'));
 }
 function googleOutput_(value) { return ContentService.createTextOutput(JSON.stringify(value)).setMimeType(ContentService.MimeType.JSON); }
 function doGet() { return googleOutput_({ ready: Boolean(PropertiesService.getScriptProperties().getProperty('DATA_FILE_ID')) }); }
+function telegramAck_() { return HtmlService.createHtmlOutput('OK'); }
 function doPost(event) {
   let body;
   try { body = JSON.parse(event.postData.contents); } catch (_) { throw new Error('Invalid JSON'); }
@@ -111,8 +114,9 @@ function doPost(event) {
     return withGoogleRuntime_(runtime => {
       const updateId = body.update_id;
       if (!Number.isSafeInteger(updateId)) throw new Error('Invalid update');
-      if (runtime.env.DB.prepare('SELECT 1 FROM google_updates WHERE id=?').bind(updateId).first()) return googleOutput_({ ok: true });
-      runtime.env.DB.prepare("INSERT INTO google_updates VALUES(?,'processing',?)").bind(updateId, Math.floor(Date.now() / 1000)).run();
+      const previous = runtime.env.DB.prepare('SELECT status FROM google_updates WHERE id=?').bind(updateId).first();
+      if (previous && previous.status === 'done') return telegramAck_();
+      if (!previous) runtime.env.DB.prepare("INSERT INTO google_updates VALUES(?,'processing',?)").bind(updateId, Math.floor(Date.now() / 1000)).run();
       const response = runtime.core.webhook(runtime.env, { waitUntil: value => value }, {
         json: () => body,
         headers: { get: name => name === 'X-Telegram-Bot-Api-Secret-Token' ? runtime.env.WEBHOOK_SECRET : null },
@@ -123,7 +127,7 @@ function doPost(event) {
         googlePlatform().telegram(runtime.env, method, payload, 'application/json', Error);
       }
       runtime.env.DB.prepare("UPDATE google_updates SET status='done' WHERE id=?").bind(updateId).run();
-      return googleOutput_({ ok: true });
+      return telegramAck_();
     });
   }
   if (!safeEqual_(body.key, properties.getProperty('MEDIA_PREPARER_KEY'))) throw new Error('Forbidden');
