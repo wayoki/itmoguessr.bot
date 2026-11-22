@@ -59,12 +59,14 @@ function installGoogleBot() {
   const controllerId = driveCreate_('controller.js', folder, controllerText);
   database.close();
   properties.setProperties({ DATA_FOLDER_ID: folder, DATA_FILE_ID: dataId, SQLITE_FILE_ID: sqliteId,
-    CORE_FILE_ID: coreId, CONTROLLER_FILE_ID: controllerId, SOURCE_COMMIT: GOOGLE_BOT_SOURCE_COMMIT, GOOGLE_BOT_ACTIVE: 'false' });
+    CORE_FILE_ID: coreId, CONTROLLER_FILE_ID: controllerId, SOURCE_COMMIT: GOOGLE_BOT_SOURCE_COMMIT, GOOGLE_BOT_ACTIVE: 'false', MEDIA_SOURCE: 'telegram' });
   console.log('Private Google runtime installed in staging mode. No Telegram webhook or timer changed.');
 }
 function googleRuntime_() {
   const properties = PropertiesService.getScriptProperties();
   const env = properties.getProperties();
+  env.MEDIA_SOURCE = 'telegram';
+  env.DRIVE_SERVICE_ACCOUNT = '';
   if (!env.DATA_FILE_ID) throw new Error('Google bot is not installed');
   if (!Array.prototype.toSorted) Array.prototype.toSorted = function(compare) { return this.slice().sort(compare); };
   const SQL = eval(driveRead_(env.SQLITE_FILE_ID).getContentText() + '\nloadGoogleSqlite();');
@@ -77,10 +79,7 @@ function googleRuntime_() {
     driveWrite_(env.DATA_FILE_ID, text);
   };
   env.DB = new core.GoogleDatabase(sqlite, persist);
-  env.MEDIA = { get: key => {
-    if (!/^drive:[\w-]+$/.test(key)) throw new Error('Private media has not been migrated');
-    return { body: { blob: driveRead_(key.slice(6)).getBlob(), cancel: () => {}, locked: false } };
-  } };
+  env.MEDIA = { get: () => { throw new Error('Upload videos directly to the bot with /add'); } };
   if (!env.DRIVE_SERVICE_ACCOUNT) env.DRIVE_SERVICE_ACCOUNT = '';
   return { env, core, sqlite, persist };
 }
@@ -135,30 +134,7 @@ function doPost(event) {
       if (env.GOOGLE_BOT_ACTIVE !== 'true') throw new Error('Destination is not active');
       core.tick(env, 'apps_script'); return googleOutput_({ ok: true });
     }
-    if (body.action === 'queue') {
-      const offset = Number(body.offset || 0), page = body.page || '';
-      if (!Number.isInteger(offset) || offset < 0 || offset > 50 || page.length > 2000) throw new Error('Invalid cursor');
-      const result = core.scanLocations(env, { page, offset }, 12);
-      return googleOutput_({ items: result.locations.filter(x => x.needsPreparation).map(x => ({ id: x.media.id, version: x.media.version })), next: result.done ? null : result.next });
-    }
-    if (body.action === 'source' || body.action === 'prepared') {
-      if (!/^[\w-]+$/.test(body.id || '') || !/^\d+$/.test(body.version || '')) throw new Error('Invalid media');
-      const metadata = core.mediaMetadata(env, body.id, body.version);
-      if (!metadata) throw new Error('Source media is not eligible');
-      if (body.action === 'source') return googleOutput_({ url: 'https://www.googleapis.com/drive/v3/files/' + body.id + '?alt=media&supportsAllDrives=true', token: core.driveToken(env) });
-      const values = [body.width, body.height, body.duration];
-      if (!values.every(x => Number.isSafeInteger(x) && x > 0) || body.width > 1920 || body.height > 1080 || typeof body.data !== 'string' || body.data.length > 40000000) throw new Error('Invalid prepared media');
-      const bytes = Utilities.base64Decode(body.data);
-      if (!bytes.length || bytes.length > 30000000) throw new Error('Prepared media exceeds limit');
-      const previous = env.DB.prepare('SELECT object_key FROM prepared_media WHERE file_id=? AND source_version=?').bind(body.id, body.version).first();
-      let fileId = previous && /^drive:/.test(previous.object_key) ? previous.object_key.slice(6) : null;
-      const blob = Utilities.newBlob(bytes, 'video/mp4', 'prepared.mp4');
-      if (fileId) driveWrite_(fileId, blob, 'video/mp4');
-      else fileId = driveCreate_('prepared-' + body.id + '-' + body.version + '.mp4', env.DATA_FOLDER_ID, blob, 'video/mp4');
-      env.DB.prepare('INSERT INTO prepared_media VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(file_id,source_version) DO UPDATE SET object_key=excluded.object_key,size=excluded.size,width=excluded.width,height=excluded.height,duration=excluded.duration,updated=excluded.updated')
-        .bind(body.id, body.version, 'drive:' + fileId, bytes.length, ...values, Math.floor(Date.now() / 1000)).run();
-      return googleOutput_({ ok: true });
-    }
+    if (body.action === 'queue') return googleOutput_({ items: [], next: null, source: 'telegram' });
     throw new Error('Unknown action');
   });
 }

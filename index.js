@@ -136,7 +136,7 @@ export async function weekCoverage(env, now = clock()) {
   const remaining = slots.length - covered.length;
   const ready = await telegramQueuePoints(env);
   let checked = true;
-  if (ready.size < remaining && env.DRIVE_SERVICE_ACCOUNT) {
+  if (ready.size < remaining && driveMediaEnabled(env)) {
     try {
       const { root, used, usedPoints, prepared } = await readLocationIndex(env);
       let token;
@@ -260,6 +260,8 @@ function classify(media, prepared) {
   return null;
 }
 
+const driveMediaEnabled = env => env.MEDIA_SOURCE !== "telegram" && Boolean(env.DRIVE_SERVICE_ACCOUNT);
+
 async function readLocationIndex(env) {
   const root = env.DRIVE_ROOT || game.drive;
   if (!driveId(root)) throw new Error("Invalid Drive root");
@@ -316,6 +318,7 @@ async function resolveLocation(env, candidate, prepared) {
 }
 
 async function scanLocations(env, cursor, limit) {
+  if (env.MEDIA_SOURCE === "telegram") return { locations: [], next: null, done: true };
   const { root, used, usedPoints, prepared } = await readLocationIndex(env);
   const page = await rootLocationsPage(env, root, cursor.page);
   const files = page.files ?? [];
@@ -335,7 +338,7 @@ async function scanLocations(env, cursor, limit) {
 async function chooseLocation(env, failedFolder) {
   const direct = await telegramLocation(env, failedFolder);
   if (direct) return direct;
-  if (!env.DRIVE_SERVICE_ACCOUNT) return null;
+  if (!driveMediaEnabled(env)) return null;
   const { root, used, usedPoints, prepared } = await readLocationIndex(env);
   const candidates = new Map();
   let token;
@@ -648,7 +651,7 @@ async function publishReport(env, now, window, table, key, prepare) {
 
 async function inventory(env) {
   const direct = await telegramInventory(env);
-  if (!env.DRIVE_SERVICE_ACCOUNT) return `Остаток видео для новых раундов\nГотовы: ${direct}\nИсточник: Telegram (locations).`;
+  if (!driveMediaEnabled(env)) return `Остаток видео для новых раундов\nГотовы: ${direct}\nИсточник: Telegram (locations).`;
   try { return `В Telegram готовы: ${direct}\n` + await driveInventory(env); }
   catch (error) {
     logFailure("Drive inventory")(error);
@@ -835,6 +838,7 @@ async function admin(env, ctx, message, command, args, updateId) {
       }
     }
     case "/sync": {
+      if (env.MEDIA_SOURCE === "telegram") return reply(message, "Видео хранятся в Telegram. Добавление — /add, остаток — /inventory. Синхронизация с Drive не нужна.");
       try {
         await verifyDrive(env);
         const location = await chooseLocation(env);

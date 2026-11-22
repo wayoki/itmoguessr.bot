@@ -61,6 +61,26 @@ test('Google runtime retains location upload, a single guess, scoring and idempo
   restored.close(); sqlite.close();
 });
 
+test('Telegram-only mode ignores legacy Drive credentials, including an empty queue after restore', () => {
+  const { core, env, sent, sqlite, snapshots, request, owner } = fixture();
+  env.MEDIA_SOURCE = 'telegram';
+  env.DRIVE_SERVICE_ACCOUNT = '{invalid legacy configuration';
+  const ctx = { waitUntil: value => value };
+  for (const message of [owner(1, { text: '/add' }), owner(2, { video: { file_id: 'telegram-only-video', file_unique_id: 'telegram-only-unique' } }),
+    owner(3, { location: { latitude: 55.75, longitude: 37.61 } }), owner(4, { text: '4500' }), owner(5, { text: '/done' })]) core.webhook(env, ctx, request(message));
+  assert.match(core.inventory(env), /Готовы: 1/);
+  assert.match(core.webhook(env, ctx, request(owner(6, { text: '/sync' }))).data.text, /Синхронизация с Drive не нужна/);
+  const restored = new SQL.Database(snapshots.at(-1));
+  env.DB = new core.GoogleDatabase(restored, () => {});
+  core.publish(env, 'manual:telegram-only', Math.floor(Date.now() / 1000) + 300);
+  assert.equal(sent.filter(x => x.method === 'sendVideo').at(-1).body.video, 'telegram-only-video');
+  assert.match(core.inventory(env), /Готовы: 0/);
+  core.publish(env, 'manual:empty-telegram', Math.floor(Date.now() / 1000) + 300);
+  assert.equal(sent.filter(x => x.method === 'sendVideo').length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(core.scanLocations(env, {}, 12))), { locations: [], next: null, done: true });
+  restored.close(); sqlite.close();
+});
+
 test('Google database rolls back a failed multi-statement operation without persisting it', () => {
   const { env, snapshots, sqlite } = fixture();
   assert.throws(() => env.DB.batch([
