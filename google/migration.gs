@@ -1,5 +1,5 @@
 function migrateSource_(action) {
-  const response=UrlFetchApp.fetch(MIGRATION_ACCESS.origin+'/migration/'+action,{method:'post',headers:{'X-ITMOGUESSR-Migration-Key':MIGRATION_ACCESS.key},muteHttpExceptions:true});
+  const response=UrlFetchApp.fetch(MIGRATION_ACCESS.origin+'/migration/'+action,{method:'post',headers:{'X-ITMOGUESSR-Migration-Key':MIGRATION_ACCESS.key,'User-Agent':'ITMOGUESSR-Google-Migration/1.0'},muteHttpExceptions:true});
   if(response.getResponseCode()!==200) throw new Error('MigrationSourceUnavailable');
   return JSON.parse(response.getContentText());
 }
@@ -55,11 +55,12 @@ function migrateImport_() {
 }
 function migrateStatus_(){
   const p=PropertiesService.getScriptProperties();
-  const result=withGoogleRuntime_(r=>({ready:true,active:r.env.GOOGLE_BOT_ACTIVE==='true',mediaSource:r.env.MEDIA_SOURCE,source:r.env.SOURCE_COMMIT,counts:Object.fromEntries(['rounds','guesses','locations','google_updates'].map(name=>[name,r.env.DB.prepare('SELECT COUNT(*) AS n FROM '+name).first('n')])),paused:r.env.DB.prepare("SELECT value FROM settings WHERE key='paused'").first('value')}));
+  const result=withGoogleRuntime_(r=>({ready:true,active:r.env.GOOGLE_BOT_ACTIVE==='true',mediaSource:r.env.MEDIA_SOURCE,source:r.env.SOURCE_COMMIT,counts:Object.fromEntries(['rounds','guesses','locations','google_updates'].map(name=>[name,r.env.DB.prepare('SELECT COUNT(*) AS n FROM '+name).first('n')])),lastGoogleTick:r.env.DB.prepare("SELECT value FROM settings WHERE key='last_apps_script_tick'").first('value'),lastTick:r.env.DB.prepare("SELECT value FROM settings WHERE key='last_tick'").first('value'),paused:r.env.DB.prepare("SELECT value FROM settings WHERE key='paused'").first('value')}));
   if(p.getProperty('BOT_TOKEN')){
     const info=googlePlatform().telegram({BOT_TOKEN:p.getProperty('BOT_TOKEN')},'getWebhookInfo',{},'application/json',Error);
     result.webhook=String(info.url||'').split('?')[0];result.pending=info.pending_update_count;result.lastErrorDate=info.last_error_date||null;
   }
+  result.timerDurationMs=Number(p.getProperty('last_timer_duration_ms'))||null;
   result.triggers=ScriptApp.getProjectTriggers().filter(x=>x.getHandlerFunction()==='scheduledCheck').length;
   return result;
 }

@@ -40,7 +40,9 @@ class GoogleBot:
 def main():
     import sys
     verify = '--verify' in sys.argv[1:]
-    GoogleBot().call('check' if verify else 'wake')
+    result = GoogleBot().call('check' if verify else 'wake')
+    if verify and (not result.get('ready') or not result.get('active')):
+        raise ValueError('Google bot is not active')
     print('Google bot access verified' if verify else 'Google schedule check completed')
 
 

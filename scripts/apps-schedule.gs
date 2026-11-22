@@ -21,6 +21,7 @@ function installSchedule() {
 }
 
 function scheduledCheck() {
+  return; // Legacy Sites timer disabled; the Google bot project has its own trigger.
   const [hour, minute] = Utilities.formatDate(new Date(), 'Europe/Moscow', 'H:m').split(':').map(Number);
   const dueHour = [9, 10, 19, 20].includes(hour);
   if ((dueHour && minute < 10) || minute % 5 === 0) {

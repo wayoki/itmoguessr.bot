@@ -12,6 +12,35 @@ function driveRequest_(method, path, payload, contentType) {
   return response;
 }
 function driveRead_(id) { return driveRequest_('get', 'drive/v3/files/' + encodeURIComponent(id) + '?alt=media'); }
+// Cache immutable code only. The changing game database is always read from Drive under the script lock.
+function cachedCode_(id, commit) {
+  const key = 'code:' + id + ':' + commit;
+  let cache;
+  try {
+    cache = CacheService.getScriptCache();
+    const meta = JSON.parse(cache.get(key + ':meta') || 'null');
+    if (meta && Number.isSafeInteger(meta.count) && meta.count > 0 && meta.count <= 200) {
+      const keys = Array.from({ length: meta.count }, (_, i) => key + ':' + i);
+      const parts = cache.getAll(keys);
+      if (keys.every(name => typeof parts[name] === 'string')) {
+        const text = keys.map(name => parts[name]).join('');
+        if (sha256_(text) === meta.sha256) return text;
+      }
+    }
+  } catch (_) {}
+  const text = driveRead_(id).getContentText();
+  try {
+    if (cache) {
+      const values = {}, count = Math.ceil(text.length / 24000);
+      if (count > 0 && count <= 200) {
+        for (let i = 0; i < count; i++) values[key + ':' + i] = text.slice(i * 24000, (i + 1) * 24000);
+        values[key + ':meta'] = JSON.stringify({ count, sha256: sha256_(text) });
+        cache.putAll(values, 21600);
+      }
+    }
+  } catch (_) {}
+  return text;
+}
 function driveWrite_(id, contents, mime) {
   return driveRequest_('patch', 'upload/drive/v3/files/' + encodeURIComponent(id) + '?uploadType=media', contents, mime || 'text/plain');
 }
@@ -69,9 +98,9 @@ function googleRuntime_() {
   env.DRIVE_SERVICE_ACCOUNT = '';
   if (!env.DATA_FILE_ID) throw new Error('Google bot is not installed');
   if (!Array.prototype.toSorted) Array.prototype.toSorted = function(compare) { return this.slice().sort(compare); };
-  const SQL = eval(driveRead_(env.SQLITE_FILE_ID).getContentText() + '\nloadGoogleSqlite();');
+  const SQL = eval(cachedCode_(env.SQLITE_FILE_ID, env.SOURCE_COMMIT) + '\nloadGoogleSqlite();');
   const platform = googlePlatform();
-  const core = eval(driveRead_(env.CORE_FILE_ID).getContentText() + '\ncreateGoogleCore(platform);');
+  const core = eval(cachedCode_(env.CORE_FILE_ID, env.SOURCE_COMMIT) + '\ncreateGoogleCore(platform);');
   const sqlite = new SQL.Database(Uint8Array.from(Utilities.base64Decode(driveRead_(env.DATA_FILE_ID).getContentText())));
   const persist = bytes => {
     const text = Utilities.base64Encode(bytesSigned_(bytes));
@@ -100,7 +129,10 @@ function scheduledCheck() {
   if (PropertiesService.getScriptProperties().getProperty('GOOGLE_BOT_ACTIVE') !== 'true') return;
   const fields = Utilities.formatDate(new Date(), 'Europe/Moscow', 'H:m').split(':').map(Number);
   if (!(([9,10,19,20].includes(fields[0]) && fields[1] < 10) || fields[1] % 5 === 0)) return;
-  return withGoogleRuntime_(runtime => runtime.core.tick(runtime.env, 'apps_script'));
+  const started = Date.now();
+  const result = withGoogleRuntime_(runtime => runtime.core.tick(runtime.env, 'apps_script'));
+  PropertiesService.getScriptProperties().setProperty('last_timer_duration_ms', String(Date.now() - started));
+  return result;
 }
 function googleOutput_(value) { return ContentService.createTextOutput(JSON.stringify(value)).setMimeType(ContentService.MimeType.JSON); }
 function doGet() { return googleOutput_({ ready: Boolean(PropertiesService.getScriptProperties().getProperty('DATA_FILE_ID')) }); }
@@ -133,7 +165,9 @@ function doPost(event) {
   if (!safeEqual_(body.key, properties.getProperty('MEDIA_PREPARER_KEY'))) throw new Error('Forbidden');
   return withGoogleRuntime_(runtime => {
     const { env, core } = runtime;
-    if (body.action === 'check') return googleOutput_({ ready: true, active: env.GOOGLE_BOT_ACTIVE === 'true' });
+    if (body.action === 'check') return googleOutput_({ ready: true, active: env.GOOGLE_BOT_ACTIVE === 'true', mediaSource: env.MEDIA_SOURCE,
+      lastGoogleTick: env.DB.prepare("SELECT value FROM settings WHERE key='last_apps_script_tick'").first('value'),
+      lastTick: env.DB.prepare("SELECT value FROM settings WHERE key='last_tick'").first('value') });
     if (body.action === 'wake') {
       if (env.GOOGLE_BOT_ACTIVE !== 'true') throw new Error('Destination is not active');
       core.tick(env, 'apps_script'); return googleOutput_({ ok: true });

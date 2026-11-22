@@ -1,58 +1,24 @@
 # Operations
 
-## Hosting
-GitHub contains bot source, migrations, tests and maintenance jobs.
-Sites serves Telegram webhooks and retains D1 game data and private R2 media.
-Player data, credentials and media files never belong in the public repository or workflow artifacts.
-Worker changes still require an authenticated Sites deployment.
+## Live runtime
+The Telegram bot runs in Google Apps Script. GitHub contains the source, migrations, tests and builds. Private SQLite game data and code assets are stored in the owner-created Google Drive folder. Video files stay in Telegram and are reused by file_id; the runtime does not download or copy videos to Drive.
+
+The source is deployed to the existing project recorded in google/deployment.json. The public webapp accepts Telegram requests only with the private webhook key; maintenance calls require ITMOGUESSR_MEDIA_KEY. Credentials, answer data and media must never be committed or placed in workflow artifacts.
 
 ## Scheduling
-The primary clock is the existing Google Apps Script minute trigger.
-Its source is scripts/apps-schedule.gs. It calls the authenticated /schedule/check endpoint every minute during the first ten minutes of 09:00, 10:00, 19:00 and 20:00 Moscow time, and every five minutes otherwise. The 09:30 report slot is covered.
-The server decides which rounds and weekly/monthly reports are due, using Europe/Moscow.
-Repeated checks are safe because server-side processing is idempotent.
+The Google bot project's every-minute scheduledCheck trigger is the primary clock. It loads the game runtime every minute during the first ten minutes of 09:00, 10:00, 19:00 and 20:00 Moscow time, and every five minutes otherwise. This includes the 09:30 weekly/monthly report slot. GitHub Actions runs CI only. The bot and its timer do not use GitHub maintenance secrets. Obsolete Sites maintenance and video-conversion workflows were removed.
 
-GitHub Actions schedule checks remain a secondary backup, requested every five minutes.
-Do not rely on Actions cron for punctual publication: the observed schedule had multi-hour gaps.
-Scheduled public-repository workflows can also be disabled after 60 days without repository activity.
+The old ITMOGUESSR scheduling script has an intentional early return and no longer calls Sites. Render itmoguessr-media remains suspended. The old ChatGPT scheduling automation remains disabled. No Cloudflare account or R2 subscription is used by the bot runtime.
 
-## Actions
-- CI: 30 game tests, 5 scheduler/video tests and a self-contained Worker build.
-- Verify bot access: authenticated check without Telegram publication.
-- Prepare Telegram videos: requested at minutes 7, 22, 37 and 52. FFmpeg converts up to two queued Drive videos and uploads to private R2.
-- Check training schedule: secondary due-round/report check.
-- Verify Actions cutover: access check, queue processing and a due-round check.
+## Owner uploads
+In the private chat: /add → one video sent as a Telegram video → coordinates or ordinary location → own score (0–5000). Then upload another video or use /done. /cancel discards the unfinished location. /inventory shows remaining videos. Owner access, duplicate protection, saved upload state and the Sunday stock calculation are retained.
 
-## Credentials
-ITMOGUESSR_MEDIA_KEY in repository secrets must match MEDIA_PREPARER_KEY in Sites.
-The existing Google script property ITMOGUESSR_SCHEDULE_KEY matches the runtime schedule digest.
-Keep these credentials private. No key rotation is needed to restore the Google clock.
+## Verification and migration
+On 22 November 2026, 30 rounds, 143 guesses, 7 Telegram locations and the existing notification/report state were imported. The final source snapshot was taken after freezing the old Sites runtime. The same Telegram bot and file IDs are preserved. A request through the new public webhook returned HTTP 200 directly and was recorded by the Google runtime. Telegram reported the Google webhook, zero pending updates and no webhook error.
 
-## Migration and verification
-- Render service itmoguessr-media is suspended.
-- MEDIA_WORKER_URL was removed; Sites version 23 uses environment revision 12.
-- The previous ChatGPT scheduling automation remains disabled.
-- Actions access, media queue and schedule checks succeeded:
-  - https://github.com/wayoki/itmoguessr.bot/actions/runs/44932355775
-  - https://github.com/wayoki/itmoguessr.bot/actions/runs/44956794766
-  - https://github.com/wayoki/itmoguessr.bot/actions/runs/44956826408
+The source Sites version 24 is retained as a frozen recovery copy. It no longer processes Telegram or schedule requests. Restore must reconcile any later Google writes before reverting the webhook; do not simply activate both runtimes. The temporary migration helper and source export credentials are removed after live verification.
 
-## Recovery verified — 22 November 2026
-The disabling early return was removed and the original Google scheduling logic was restored.
-The saved editor source shows the active scheduledCheck body, with no early return.
-Two independent live-database observations confirmed autonomous Google calls:
-- last_apps_script_tick = 1795310121 (04:15:21 Europe/Moscow).
-- last_apps_script_tick = 1795312821 (05:00:21 Europe/Moscow).
-No manual schedule request was made to produce these observations.
-The bot remains unpaused (paused = 0).
-The GitHub copy now matches the restored scheduling logic.
-Local checks passed for publication/reveal windows, the 09:30 report slot, and idle-hour filtering.
-These checks verify timer connectivity and code paths; the next actual scheduled round remains the production publication check.
+## Limits
+Apps Script and Drive quotas still apply. The SQLite snapshot guard is 8 MB base64. Keeping the bot running does not require ChatGPT or the owner's computer to remain open. Changes to hosted source require uploading the complete Apps Script source and publishing a new version of the existing deployment, preserving its URL.
 
-### Telegram uploads (target Google runtime)
-
-The owner uses /add → one Telegram video → coordinates → own score (0–5000), then /done. Files stay in Telegram and are reused by file_id. Google persists only SQLite game data and runtime code. MEDIA_SOURCE is forced to telegram in the Google adapter, including when legacy Drive credentials are present. The target runtime has no source/prepared-video upload endpoints. The live Sites runtime remains in service until data migration and a verified Google cutover.
-
-### Google staging installed — 22 November 2026
-
-The Google runtime and private SQLite storage were installed successfully in the existing Apps Script project. Drive API v3 is enabled; runtime remains inactive and no Telegram webhook cutover has occurred. The public incoming webapp address requires explicit owner approval before deployment. Migration source export/freeze, destination import with rollback, and notification preservation have been prepared and tested. GitHub CI for commit 389cc526ee3e3200296f2ff80b98b21e61795123 succeeded. No production data or tokens are in the public repository.
+Autonomous Google timer tick verified at Unix 1795355771 (22 November 2026, 16:56:11 Moscow). No manual wake call was used to produce this tick. Immutable code caching avoids downloading the SQLite module for every request; game data is always read under the script lock.

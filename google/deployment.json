@@ -1,12 +1,25 @@
 {
   "script_id": "1HvBTKjbkkCLVgeejLJr6eNH2T3mJvnO4XEpr_o2E0XSc5V3HAvs0rdR2",
-  "status": "staging_installed",
-  "webapp_url": null,
-  "live_traffic_migrated": false,
-  "source_commit": "55f3f40b2ad0b3f3aa7a212f32d7dd9f00a50e63",
+  "status": "live",
+  "webapp_url": "https://script.google.com/macros/s/AKfycbxNT6pjMbFB1bnOkJPfI4uoY5fbxCsxle59jOXGKdDIR5L6iSW3Ya7hbJ6OC28JUYmpxg/exec",
+  "live_traffic_migrated": true,
+  "source_commit": "389cc526ee3e3200296f2ff80b98b21e61795123",
   "target_source_commit": "389cc526ee3e3200296f2ff80b98b21e61795123",
   "database_created": true,
   "media_source": "telegram",
-  "runtime_active": false,
-  "public_webapp_approval_pending": true
+  "runtime_active": true,
+  "public_webapp_approval_pending": false,
+  "core_source_commit": "389cc526ee3e3200296f2ff80b98b21e61795123",
+  "source_backup_sites_version": 24,
+  "migrated_counts": {
+    "rounds": 30,
+    "guesses": 143,
+    "locations": 7
+  },
+  "legacy_sites_frozen": true,
+  "legacy_scheduler_disabled": true,
+  "controller_source_commit": null,
+  "verified_google_tick": 1795355771,
+  "webhook_direct_http": 200,
+  "actions": "ci_only"
 }
