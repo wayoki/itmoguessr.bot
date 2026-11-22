@@ -21,7 +21,11 @@ function installSchedule() {
 }
 
 function scheduledCheck() {
-  checkSchedule();
+  const [hour, minute] = Utilities.formatDate(new Date(), 'Europe/Moscow', 'H:m').split(':').map(Number);
+  const dueHour = [9, 10, 19, 20].includes(hour);
+  if ((dueHour && minute < 10) || minute % 5 === 0) {
+    checkSchedule();
+  }
 }
 
 function checkSchedule() {
