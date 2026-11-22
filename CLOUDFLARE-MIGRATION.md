@@ -25,3 +25,9 @@ R2 activation or billing prompts require the account owner; do not accept a paid
 6. Remove temporary migration access after verification. Keep a private rollback snapshot.
 
 Status: deployment preparation only. Data, secrets and live Telegram traffic have not been migrated yet.
+
+## Access verification — 22 November 2026
+The owner added both credentials to environment itmoguessrbot. Deployment and access workflows now select that environment.
+https://github.com/wayoki/itmoguessr.bot/actions/runs/44976842796 confirmed Workers and D1 access (both empty).
+R2 returned HTTP 403, error 10042 (NotEntitled). The account owner must activate R2 before a bucket-backed deployment or media transfer can proceed.
+No production data, webhook or runtime secrets have been moved yet.
