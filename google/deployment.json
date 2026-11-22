@@ -18,8 +18,13 @@
   },
   "legacy_sites_frozen": true,
   "legacy_scheduler_disabled": true,
-  "controller_source_commit": null,
+  "controller_source_commit": "73b82e2ef553f6c296ed374adc1029d86766376f",
   "verified_google_tick": 1795355771,
   "webhook_direct_http": 200,
-  "actions": "ci_only"
+  "actions": "ci_only",
+  "google_deployment_version": 4,
+  "temporary_migration_disabled": true,
+  "source_export_disabled": true,
+  "source_env_revision": 15,
+  "verified_ci_run": 45031482150
 }

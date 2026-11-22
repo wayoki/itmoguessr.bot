@@ -16,7 +16,7 @@ In the private chat: /add → one video sent as a Telegram video → coordinates
 ## Verification and migration
 On 22 November 2026, 30 rounds, 143 guesses, 7 Telegram locations and the existing notification/report state were imported. The final source snapshot was taken after freezing the old Sites runtime. The same Telegram bot and file IDs are preserved. A request through the new public webhook returned HTTP 200 directly and was recorded by the Google runtime. Telegram reported the Google webhook, zero pending updates and no webhook error.
 
-The source Sites version 24 is retained as a frozen recovery copy. It no longer processes Telegram or schedule requests. Restore must reconcile any later Google writes before reverting the webhook; do not simply activate both runtimes. The temporary migration helper and source export credentials are removed after live verification.
+The source Sites version 24 is retained as a frozen recovery copy. It no longer processes Telegram or schedule requests. Restore must reconcile any later Google writes before reverting the webhook; do not simply activate both runtimes. The temporary migration helper was removed from the live Google deployment (version 4). Source export credentials were invalidated in Sites environment revision 15 and the frozen recovery version was redeployed. The old authenticated export now returns HTTP 404.
 
 ## Limits
 Apps Script and Drive quotas still apply. The SQLite snapshot guard is 8 MB base64. Keeping the bot running does not require ChatGPT or the owner's computer to remain open. Changes to hosted source require uploading the complete Apps Script source and publishing a new version of the existing deployment, preserving its URL.
