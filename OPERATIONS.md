@@ -48,3 +48,9 @@ The bot remains unpaused (paused = 0).
 The GitHub copy now matches the restored scheduling logic.
 Local checks passed for publication/reveal windows, the 09:30 report slot, and idle-hour filtering.
 These checks verify timer connectivity and code paths; the next actual scheduled round remains the production publication check.
+
+## Google runtime migration in progress
+The target is GitHub source/CI/media processing plus Google Apps Script and private Drive storage. Own-account Cloudflare deployment workflows have been removed; no Cloudflare resources or paid subscription were created.
+The Google-compatible core retains the existing SQLite schema, constraints and game logic. All 33 JavaScript tests passed, including converted-runtime upload/guess/scoring/reveal, persistence and rollback tests.
+A separate Apps Script project was created: 1HvBTKjbkkCLVgeejLJr6eNH2T3mJvnO4XEpr_o2E0XSc5V3HAvs0rdR2.
+The Google installation is not yet authorized or active. Production remains on Sites until private data/secret/media transfer, Google authorization and end-to-end webhook/timer checks are complete.

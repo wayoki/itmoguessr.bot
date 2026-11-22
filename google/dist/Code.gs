@@ -1,0 +1,230 @@
+// Set to the immutable GitHub commit selected for this installation.
+const GOOGLE_BOT_SOURCE_COMMIT = '__SOURCE_COMMIT__';
+
+function driveRequest_(method, path, payload, contentType) {
+  const options = { method, muteHttpExceptions: true, headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() } };
+  if (payload !== undefined) {
+    options.payload = contentType === 'application/json' ? JSON.stringify(payload) : payload;
+    if (contentType) options.contentType = contentType;
+  }
+  const response = UrlFetchApp.fetch('https://www.googleapis.com/' + path, options);
+  if (response.getResponseCode() < 200 || response.getResponseCode() >= 300) throw new Error('Private Drive storage HTTP ' + response.getResponseCode());
+  return response;
+}
+function driveRead_(id) { return driveRequest_('get', 'drive/v3/files/' + encodeURIComponent(id) + '?alt=media'); }
+function driveWrite_(id, contents, mime) {
+  return driveRequest_('patch', 'upload/drive/v3/files/' + encodeURIComponent(id) + '?uploadType=media', contents, mime || 'text/plain');
+}
+function driveCreate_(name, parent, contents, mime) {
+  const metadata = { name, mimeType: mime || 'text/plain' };
+  if (parent) metadata.parents = [parent];
+  const file = JSON.parse(driveRequest_('post', 'drive/v3/files', metadata, 'application/json').getContentText());
+  if (contents !== undefined) driveWrite_(file.id, contents, mime);
+  return file.id;
+}
+function bytesSigned_(bytes) { return Array.from(bytes, value => value > 127 ? value - 256 : value); }
+function sha256_(text) {
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, text, Utilities.Charset.UTF_8)
+    .map(byte => (byte & 255).toString(16).padStart(2, '0')).join('');
+}
+function safeEqual_(left, right) {
+  if (!left || !right) return false;
+  const a = sha256_(String(left)), b = sha256_(String(right));
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+function installGoogleBot() {
+  if (!/^[a-f0-9]{40}$/.test(GOOGLE_BOT_SOURCE_COMMIT)) throw new Error('Set the reviewed source commit first');
+  const properties = PropertiesService.getScriptProperties();
+  if (properties.getProperty('DATA_FILE_ID')) throw new Error('Already installed; existing data was preserved');
+  const root = 'https://raw.githubusercontent.com/wayoki/itmoguessr.bot/' + GOOGLE_BOT_SOURCE_COMMIT + '/google/dist/';
+  const manifest = JSON.parse(UrlFetchApp.fetch(root + 'manifest.json').getContentText());
+  const sources = {};
+  for (const name of ['sqlite.js', 'core.js', 'schema.sql']) {
+    const result = UrlFetchApp.fetch(root + manifest[name].download);
+    const text = manifest[name].gzip ? Utilities.ungzip(result.getBlob()).getDataAsString() : result.getContentText();
+    if (sha256_(text) !== manifest[name].sha256) throw new Error('Source checksum mismatch: ' + name);
+    sources[name] = text;
+  }
+  const folder = driveCreate_('ITMOGUESSR private bot', null, undefined, 'application/vnd.google-apps.folder');
+  const sqliteId = driveCreate_('sqlite.js', folder, sources['sqlite.js']);
+  const coreId = driveCreate_('core.js', folder, sources['core.js']);
+  const SQL = eval(sources['sqlite.js'] + '\nloadGoogleSqlite();');
+  const database = new SQL.Database();
+  database.run(sources['schema.sql']);
+  database.run("INSERT INTO settings VALUES('paused','1')");
+  const dataId = driveCreate_('bot.sqlite.base64', folder, Utilities.base64Encode(bytesSigned_(database.export())));
+  const controllerText = UrlFetchApp.fetch(root + 'Code.gs').getContentText().replace('__SOURCE_COMMIT__', GOOGLE_BOT_SOURCE_COMMIT);
+  const controllerId = driveCreate_('controller.js', folder, controllerText);
+  database.close();
+  properties.setProperties({ DATA_FOLDER_ID: folder, DATA_FILE_ID: dataId, SQLITE_FILE_ID: sqliteId,
+    CORE_FILE_ID: coreId, CONTROLLER_FILE_ID: controllerId, SOURCE_COMMIT: GOOGLE_BOT_SOURCE_COMMIT, GOOGLE_BOT_ACTIVE: 'false' });
+  console.log('Private Google runtime installed in staging mode. No Telegram webhook or timer changed.');
+}
+function googleRuntime_() {
+  const properties = PropertiesService.getScriptProperties();
+  const env = properties.getProperties();
+  if (!env.DATA_FILE_ID) throw new Error('Google bot is not installed');
+  if (!Array.prototype.toSorted) Array.prototype.toSorted = function(compare) { return this.slice().sort(compare); };
+  const SQL = eval(driveRead_(env.SQLITE_FILE_ID).getContentText() + '\nloadGoogleSqlite();');
+  const platform = googlePlatform();
+  const core = eval(driveRead_(env.CORE_FILE_ID).getContentText() + '\ncreateGoogleCore(platform);');
+  const sqlite = new SQL.Database(Uint8Array.from(Utilities.base64Decode(driveRead_(env.DATA_FILE_ID).getContentText())));
+  const persist = bytes => {
+    const text = Utilities.base64Encode(bytesSigned_(bytes));
+    if (text.length > 8000000) throw new Error('Database exceeds the reviewed Google runtime size limit');
+    driveWrite_(env.DATA_FILE_ID, text);
+  };
+  env.DB = new core.GoogleDatabase(sqlite, persist);
+  env.MEDIA = { get: key => {
+    if (!/^drive:[\w-]+$/.test(key)) throw new Error('Private media has not been migrated');
+    return { body: { blob: driveRead_(key.slice(6)).getBlob(), cancel: () => {}, locked: false } };
+  } };
+  if (!env.DRIVE_SERVICE_ACCOUNT) env.DRIVE_SERVICE_ACCOUNT = '';
+  return { env, core, sqlite, persist };
+}
+function withGoogleRuntime_(action) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) throw new Error('Bot is busy; retry the request');
+  let runtime;
+  try { runtime = googleRuntime_(); return action(runtime); }
+  finally { if (runtime) runtime.sqlite.close(); lock.releaseLock(); }
+}
+function verifyGoogleBot() {
+  return withGoogleRuntime_(runtime => {
+    const count = name => runtime.env.DB.prepare('SELECT COUNT(*) AS n FROM ' + name).first('n');
+    console.log(JSON.stringify({ ready: true, active: runtime.env.GOOGLE_BOT_ACTIVE === 'true', rounds: count('rounds'), guesses: count('guesses'), locations: count('locations') }));
+  });
+}
+function scheduledCheck() {
+  if (PropertiesService.getScriptProperties().getProperty('GOOGLE_BOT_ACTIVE') !== 'true') return;
+  return withGoogleRuntime_(runtime => runtime.core.tick(runtime.env, 'apps_script'));
+}
+function googleOutput_(value) { return ContentService.createTextOutput(JSON.stringify(value)).setMimeType(ContentService.MimeType.JSON); }
+function doGet() { return googleOutput_({ ready: Boolean(PropertiesService.getScriptProperties().getProperty('DATA_FILE_ID')) }); }
+function doPost(event) {
+  let body;
+  try { body = JSON.parse(event.postData.contents); } catch (_) { throw new Error('Invalid JSON'); }
+  const properties = PropertiesService.getScriptProperties();
+  if (!body.action) {
+    if (properties.getProperty('GOOGLE_BOT_ACTIVE') !== 'true' || !safeEqual_(event.parameter && event.parameter.key, properties.getProperty('WEBHOOK_SECRET'))) throw new Error('Forbidden');
+    return withGoogleRuntime_(runtime => {
+      const updateId = body.update_id;
+      if (!Number.isSafeInteger(updateId)) throw new Error('Invalid update');
+      if (runtime.env.DB.prepare('SELECT 1 FROM google_updates WHERE id=?').bind(updateId).first()) return googleOutput_({ ok: true });
+      runtime.env.DB.prepare("INSERT INTO google_updates VALUES(?,'processing',?)").bind(updateId, Math.floor(Date.now() / 1000)).run();
+      const response = runtime.core.webhook(runtime.env, { waitUntil: value => value }, {
+        json: () => body,
+        headers: { get: name => name === 'X-Telegram-Bot-Api-Secret-Token' ? runtime.env.WEBHOOK_SECRET : null },
+      });
+      if (response && response.data && response.data.method) {
+        const payload = Object.assign({}, response.data), method = payload.method;
+        delete payload.method;
+        googlePlatform().telegram(runtime.env, method, payload, 'application/json', Error);
+      }
+      runtime.env.DB.prepare("UPDATE google_updates SET status='done' WHERE id=?").bind(updateId).run();
+      return googleOutput_({ ok: true });
+    });
+  }
+  if (!safeEqual_(body.key, properties.getProperty('MEDIA_PREPARER_KEY'))) throw new Error('Forbidden');
+  return withGoogleRuntime_(runtime => {
+    const { env, core } = runtime;
+    if (body.action === 'check') return googleOutput_({ ready: true, active: env.GOOGLE_BOT_ACTIVE === 'true' });
+    if (body.action === 'wake') {
+      if (env.GOOGLE_BOT_ACTIVE !== 'true') throw new Error('Destination is not active');
+      core.tick(env, 'apps_script'); return googleOutput_({ ok: true });
+    }
+    if (body.action === 'queue') {
+      const offset = Number(body.offset || 0), page = body.page || '';
+      if (!Number.isInteger(offset) || offset < 0 || offset > 50 || page.length > 2000) throw new Error('Invalid cursor');
+      const result = core.scanLocations(env, { page, offset }, 12);
+      return googleOutput_({ items: result.locations.filter(x => x.needsPreparation).map(x => ({ id: x.media.id, version: x.media.version })), next: result.done ? null : result.next });
+    }
+    if (body.action === 'source' || body.action === 'prepared') {
+      if (!/^[\w-]+$/.test(body.id || '') || !/^\d+$/.test(body.version || '')) throw new Error('Invalid media');
+      const metadata = core.mediaMetadata(env, body.id, body.version);
+      if (!metadata) throw new Error('Source media is not eligible');
+      if (body.action === 'source') return googleOutput_({ url: 'https://www.googleapis.com/drive/v3/files/' + body.id + '?alt=media&supportsAllDrives=true', token: core.driveToken(env) });
+      const values = [body.width, body.height, body.duration];
+      if (!values.every(x => Number.isSafeInteger(x) && x > 0) || body.width > 1920 || body.height > 1080 || typeof body.data !== 'string' || body.data.length > 40000000) throw new Error('Invalid prepared media');
+      const bytes = Utilities.base64Decode(body.data);
+      if (!bytes.length || bytes.length > 30000000) throw new Error('Prepared media exceeds limit');
+      const previous = env.DB.prepare('SELECT object_key FROM prepared_media WHERE file_id=? AND source_version=?').bind(body.id, body.version).first();
+      let fileId = previous && /^drive:/.test(previous.object_key) ? previous.object_key.slice(6) : null;
+      const blob = Utilities.newBlob(bytes, 'video/mp4', 'prepared.mp4');
+      if (fileId) driveWrite_(fileId, blob, 'video/mp4');
+      else fileId = driveCreate_('prepared-' + body.id + '-' + body.version + '.mp4', env.DATA_FOLDER_ID, blob, 'video/mp4');
+      env.DB.prepare('INSERT INTO prepared_media VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(file_id,source_version) DO UPDATE SET object_key=excluded.object_key,size=excluded.size,width=excluded.width,height=excluded.height,duration=excluded.duration,updated=excluded.updated')
+        .bind(body.id, body.version, 'drive:' + fileId, bytes.length, ...values, Math.floor(Date.now() / 1000)).run();
+      return googleOutput_({ ok: true });
+    }
+    throw new Error('Unknown action');
+  });
+}
+
+function googlePlatform() {
+  const response = function(body, options) { this.body = body; this.status = options && options.status || 200; };
+  response.json = value => ({ data: value });
+  function request(url, options) {
+    try { return UrlFetchApp.fetch(url, Object.assign({ muteHttpExceptions: true }, options)); }
+    catch (_) { throw new Error('External service network error'); }
+  }
+  function jsonResponse(result, Failure, service) {
+    const status = result.getResponseCode();
+    if (status < 200 || status >= 300) throw new Failure(service, status);
+    return { json: () => JSON.parse(result.getContentText()), body: { blob: result.getBlob(), cancel: () => {}, locked: false } };
+  }
+  function send(env, method, payload, Failure) {
+    if (!env.BOT_TOKEN) throw new Error('Missing Telegram token');
+    const multipart = Object.values(payload).some(value => value && typeof value.getBytes === 'function');
+    const result = request('https://api.telegram.org/bot' + env.BOT_TOKEN + '/' + method, multipart
+      ? { method: 'post', payload }
+      : { method: 'post', contentType: 'application/json', payload: JSON.stringify(payload) });
+    let data;
+    try { data = JSON.parse(result.getContentText()); } catch (_) { throw new Error('Telegram response is unconfirmed'); }
+    if (!data.ok) throw new Failure('Telegram', data.error_code || result.getResponseCode(), data.parameters && data.parameters.retry_after);
+    return data.result;
+  }
+  function token(env, Failure) {
+    if (!env.DRIVE_SERVICE_ACCOUNT) return ScriptApp.getOAuthToken();
+    const account = JSON.parse(env.DRIVE_SERVICE_ACCOUNT);
+    const now = Math.floor(Date.now() / 1000);
+    const payload = data => Utilities.base64EncodeWebSafe(JSON.stringify(data)).replace(/=+$/, '');
+    const jwt = payload({ alg: 'RS256', typ: 'JWT' }) + '.' + payload({
+      iss: account.client_email, aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600,
+      scope: 'https://www.googleapis.com/auth/drive.readonly',
+    });
+    const signature = Utilities.base64EncodeWebSafe(Utilities.computeRsaSha256Signature(jwt, account.private_key)).replace(/=+$/, '');
+    const result = request('https://oauth2.googleapis.com/token', { method: 'post', payload: {
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: jwt + '.' + signature,
+    } });
+    return jsonResponse(result, Failure, 'Google OAuth').json().access_token;
+  }
+  let cachedToken;
+  return {
+    Response: response, uuid: () => Utilities.getUuid(),
+    telegram: (env, method, body, contentType, Failure) => send(env, method, body, Failure),
+    driveToken: (env, Failure) => cachedToken || (cachedToken = token(env, Failure)),
+    driveFetch: (env, path, params, timeout, Failure) => {
+      cachedToken = cachedToken || token(env, Failure);
+      const query = Object.keys(params).map(key => encodeURIComponent(key) + '=' + encodeURIComponent(params[key])).join('&');
+      return jsonResponse(request('https://www.googleapis.com/drive/v3/files' + path + '?' + query, {
+        headers: { Authorization: 'Bearer ' + cachedToken },
+      }), Failure, 'Google Drive');
+    },
+    upload: (env, location, round, source, Failure) => {
+      const field = location.format[1];
+      const blob = source.blob;
+      if (!blob || blob.getBytes().length > 30000000) throw new Error('Prepared media is missing or exceeds the Google upload limit');
+      blob.setName('round-' + round.id + '.' + location.format[2]);
+      const payload = {
+        chat_id: round.chat, caption: 'Раунд #' + round.id + ' (до ' + Utilities.formatDate(new Date(round.ends * 1000), 'Europe/Moscow', 'dd.MM, H:mm') + ' МСК)',
+        reply_markup: JSON.stringify({ inline_keyboard: [[{ text: 'Guess!', url: 'https://t.me/itmoguessr_bot?start=round_v2_' + round.id }]] }),
+      };
+      payload[field] = blob;
+      if (field === 'video') payload.supports_streaming = 'true';
+      return send(env, location.format[0], payload, Failure);
+    },
+  };
+}

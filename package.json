@@ -2,5 +2,15 @@
   "name": "itmoguessr-worker",
   "private": true,
   "type": "module",
-  "scripts": {"test": "node --test", "build": "node scripts/build.js"}
+  "scripts": {
+    "test": "node --test",
+    "build": "node scripts/build.js",
+    "build:google": "node scripts/build-google.js"
+  },
+  "devDependencies": {
+    "@babel/generator": "^8.1.3",
+    "@babel/parser": "^8.1.3",
+    "@babel/traverse": "^8.1.3",
+    "sql.js": "^1.17.0"
+  }
 }
