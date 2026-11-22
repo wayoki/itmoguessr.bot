@@ -32,3 +32,10 @@ Manual jobs fail explicitly if credentials are absent.
 
 If recovering the old Render pipeline, resume the service, update its media-key digest to match the current key, and restore MEDIA_WORKER_URL.
 Re-enabling the old Apps Script scheduler requires removing the early return in scheduledCheck. Do not re-enable it during normal Actions operation.
+
+## Automatic verification — 22 November 2026 (Europe/Moscow)
+- Schedule-triggered round/report check succeeded: https://github.com/wayoki/itmoguessr.bot/actions/runs/44956794766
+- Schedule-triggered media preparation succeeded: https://github.com/wayoki/itmoguessr.bot/actions/runs/44956826408
+- The credentials-required steps executed successfully, rather than being skipped. The media queue had zero pending conversions and zero errors.
+- Both automatic jobs completed around 01:27 Moscow time. At the 03:52 verification, these were still the most recent scheduled runs. Treat the configured 5/15-minute cron intervals as requested cadence, not a punctuality guarantee.
+- The proposed temporary Google fallback was not deployed: the saved scheduledCheck early return remains in place because real Actions schedule events are now verified.
