@@ -7,8 +7,8 @@ Player data, credentials and media files never belong in the public repository o
 Worker changes still require an authenticated Sites deployment.
 
 ## Scheduling
-The intended primary clock is the existing Google Apps Script minute trigger.
-Its source is scripts/apps-schedule.gs: scheduledCheck calls the authenticated /schedule/check endpoint on every invocation.
+The primary clock is the existing Google Apps Script minute trigger.
+Its source is scripts/apps-schedule.gs. It calls the authenticated /schedule/check endpoint every minute during the first ten minutes of 09:00, 10:00, 19:00 and 20:00 Moscow time, and every five minutes otherwise. The 09:30 report slot is covered.
 The server decides which rounds and weekly/monthly reports are due, using Europe/Moscow.
 Repeated checks are safe because server-side processing is idempotent.
 
@@ -37,9 +37,14 @@ Keep these credentials private. No key rotation is needed to restore the Google 
   - https://github.com/wayoki/itmoguessr.bot/actions/runs/44956794766
   - https://github.com/wayoki/itmoguessr.bot/actions/runs/44956826408
 
-## Recovery status — 22 November 2026
-The corrected minute-clock source is committed and passes a local syntax/call test.
-Applying that source in Google Apps Script and verifying autonomous timer calls remains outstanding.
-The browser editor did not reliably accept or persist edits; do not treat UI attempts as a completed deployment.
-At the latest database check, last_apps_script_tick was still 1795283721.
-Before declaring recovery complete, save the corrected script with the existing minute trigger and observe last_apps_script_tick advance on at least two autonomous executions.
+## Recovery verified — 22 November 2026
+The disabling early return was removed and the original Google scheduling logic was restored.
+The saved editor source shows the active scheduledCheck body, with no early return.
+Two independent live-database observations confirmed autonomous Google calls:
+- last_apps_script_tick = 1795310121 (04:15:21 Europe/Moscow).
+- last_apps_script_tick = 1795312821 (05:00:21 Europe/Moscow).
+No manual schedule request was made to produce these observations.
+The bot remains unpaused (paused = 0).
+The GitHub copy now matches the restored scheduling logic.
+Local checks passed for publication/reveal windows, the 09:30 report slot, and idle-hour filtering.
+These checks verify timer connectivity and code paths; the next actual scheduled round remains the production publication check.
