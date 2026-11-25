@@ -4,12 +4,12 @@
   "webapp_url": "https://script.google.com/macros/s/AKfycbxNT6pjMbFB1bnOkJPfI4uoY5fbxCsxle59jOXGKdDIR5L6iSW3Ya7hbJ6OC28JUYmpxg/exec",
   "live_traffic_migrated": true,
   "source_commit": "389cc526ee3e3200296f2ff80b98b21e61795123",
-  "target_source_commit": "389cc526ee3e3200296f2ff80b98b21e61795123",
+  "target_source_commit": "6fe401d8a058f764311dc8e87b5503d74bd491b2",
   "database_created": true,
   "media_source": "telegram",
   "runtime_active": true,
   "public_webapp_approval_pending": false,
-  "core_source_commit": "389cc526ee3e3200296f2ff80b98b21e61795123",
+  "core_source_commit": "6fe401d8a058f764311dc8e87b5503d74bd491b2",
   "source_backup_sites_version": 24,
   "migrated_counts": {
     "rounds": 30,
@@ -26,5 +26,16 @@
   "temporary_migration_disabled": true,
   "source_export_disabled": true,
   "source_env_revision": 15,
-  "verified_ci_run": 45031482150
+  "verified_ci_run": 45031482150,
+  "community_panoramas": {
+    "verified_at": "2026-11-25T19:43:05+03:00",
+    "callback_queries_enabled": true,
+    "preserved_counts": {
+      "locations": 21,
+      "location_upload_sessions": 1,
+      "rounds": 36,
+      "guesses": 161,
+      "outbox": 269
+    }
+  }
 }
