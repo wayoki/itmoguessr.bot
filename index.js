@@ -1,8 +1,8 @@
-import { addLocation, telegramLocation, telegramInventory, telegramQueuePoints } from "./locations-add.js";
+import { addLocation, telegramLocation, telegramInventory, telegramQueuePoints, uploadOwner, isPanoramaAdmin } from "./locations-add.js";
 
 const game = {
   bot: "itmoguessr_bot",
-  author: { name: "макс.", username: "wayoki" },
+  club: { name: "ITMOGUESSR*", profile: "https://t.me/itmoguessr" },
   chat: "@swidfkjew",
   drive: "1rlP26NNEgdsHkv1n1QGo9SAkaT6aCady",
   timezone: "Europe/Moscow",
@@ -57,6 +57,68 @@ export function coordinates(name) {
   if (!match) return null;
   const point = match.slice(1).map(Number);
   return Math.abs(point[0]) <= 90 && Math.abs(point[1]) <= 180 ? point : null;
+}
+
+function mapsLink(text) {
+  const match = /^(https:\/\/(?:www\.google\.[a-z.]+|maps\.google\.[a-z.]+|maps\.app\.goo\.gl|goo\.gl))([^\s#]*)$/i.exec(text);
+  if (!match) return null;
+  const host = match[1].toLowerCase();
+  const path = match[2];
+  if (host === "https://maps.app.goo.gl" || host === "https://goo.gl") {
+    return /^\/(?:maps\/)?[A-Za-z0-9_-]+(?:\?[^\s]*)?$/.test(path) ? { short: true, path } : null;
+  }
+  if (!/^https:\/\/(?:www|maps)\.google\.(?:com|ru|de|co\.uk|com\.ua|com\.tr|fr|it|es|nl|pl|ca|com\.au)$/.test(host)) return null;
+  if (host.startsWith("https://www.") && !/^\/maps(?:\/|\?|$)/.test(path)) return null;
+  return { path };
+}
+
+export function mapsCoordinates(text) {
+  const link = mapsLink(text);
+  if (!link || link.short) return null;
+  let path;
+  try { path = decodeURIComponent(link.path).replace(/\+/g, " "); } catch { return null; }
+  for (const value of path.matchAll(/[?&](?:query|q|ll|cbll|viewpoint)=([^&]+)/gi)) {
+    const match = /^\s*([\d. -]+,\s*[\d.-]+)(?:\s*\([^)]*\))?\s*$/.exec(value[1]);
+    const point = match && coordinates(match[1].trim());
+    if (point) return point;
+  }
+  for (const pattern of [
+    /!3d(-?[\d.]+)!4d(-?[\d.]+)/g,
+    /!1d(-?[\d.]+)!2d(-?[\d.]+)/g,
+    /@(-?[\d.]+),(-?[\d.]+)(?=[,/?]|$)/g,
+  ]) {
+    for (const match of path.matchAll(pattern)) {
+      const point = coordinates(match[1] + "," + match[2]);
+      if (point) return point;
+    }
+  }
+  return null;
+}
+
+async function mapsRedirect(url) {
+  const response = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(5000) });
+  const location = response.status >= 300 && response.status < 400 ? response.headers.get("location") : null;
+  if (response.body) await response.body.cancel();
+  return location;
+}
+
+async function locationPoint(message) {
+  const geo = message.location;
+  if (geo) {
+    return !geo.live_period && Number.isFinite(geo.latitude) && Number.isFinite(geo.longitude) &&
+      Math.abs(geo.latitude) <= 90 && Math.abs(geo.longitude) <= 180 ? [geo.latitude, geo.longitude] : null;
+  }
+  let text = String(message.text || "").trim();
+  try {
+    for (let hop = 0; hop <= 3; hop++) {
+      const point = coordinates(text) || mapsCoordinates(text);
+      if (point) return point;
+      if (hop === 3 || !mapsLink(text)?.short) break;
+      text = await mapsRedirect(text);
+      if (!text) break;
+    }
+  } catch { /* The user can still send coordinates or a Telegram pin. */ }
+  return null;
 }
 
 export function filenameLocation(name) {
@@ -384,14 +446,8 @@ async function telegram(env, method, body, contentType = "application/json") {
 export function multipart(location, round) {
   const [, field, extension] = location.format;
   const boundary = `itmoguessr-${crypto.randomUUID()}`;
-  const deadline = timeLabel.formatToParts(round.ends * 1000)
-    .map(({ type, value }) => type === "hour" ? String(Number(value)) : value).join("");
-  const fields = {
-    chat_id: round.chat, caption: `Раунд #${round.id} (до ${deadline} МСК)`,
-    reply_markup: JSON.stringify({ inline_keyboard: [[{
-      text: "Guess!", url: `https://t.me/${game.bot}?start=${roundLinkPrefix}${round.id}`,
-    }]] }),
-  };
+  const post = roundPost(round);
+  const fields = { ...post, reply_markup: JSON.stringify(post.reply_markup) };
   if (field === "video") {
     fields.supports_streaming = "true";
     const { width, height, durationMillis } = location.media.videoMediaMetadata ?? {};
@@ -442,29 +498,30 @@ async function publish(env, slot, end) {
     ? await env.MEDIA.get(location.objectKey)
     : await driveFetch(env, "/" + encodeURIComponent(location.media.id), { alt: "media", supportsAllDrives: "true" });
   if (!location.telegramFileId && !source?.body) throw new Error("Media body is unavailable");
+  const authorship = [location.authorUser ?? null, location.authorName ?? null, location.difficulty ?? null];
   let round;
   try {
     const now = clock();
     if (now >= end) return null;
-    round = await db(env, `INSERT INTO rounds(slot,folder,latitude,longitude,author_points,chat,ends,status,updated)
-      VALUES(?,?,?,?,?,?,?,'publishing',?) ON CONFLICT DO NOTHING RETURNING *`,
-    slot, location.folder, ...location.point, location.authorPoints, chat(env), end, now).first();
+    round = await db(env, `INSERT INTO rounds(slot,folder,latitude,longitude,author_points,author_user,author_name,difficulty,chat,ends,status,updated)
+      VALUES(?,?,?,?,?,?,?,?,?,?,'publishing',?) ON CONFLICT DO NOTHING RETURNING *`,
+    slot, location.folder, ...location.point, location.authorPoints, ...authorship, chat(env), end, now).first();
     if (!round && saved?.status === "failed") {
-      round = await db(env, `UPDATE rounds SET folder=?,latitude=?,longitude=?,author_points=?,chat=?,ends=?,status='publishing',updated=?
+      round = await db(env, `UPDATE rounds SET folder=?,latitude=?,longitude=?,author_points=?,author_user=?,author_name=?,difficulty=?,chat=?,ends=?,status='publishing',updated=?
         WHERE slot=? AND status='failed' AND NOT EXISTS(SELECT 1 FROM rounds WHERE folder=? AND status<>'failed') RETURNING *`,
-      location.folder, ...location.point, location.authorPoints, chat(env), end, now, slot, location.folder).first();
+      location.folder, ...location.point, location.authorPoints, ...authorship, chat(env), end, now, slot, location.folder).first();
     }
     if (!round) return null;
 
     let message;
     try {
-      message = location.telegramFileId ? await telegram(env, "sendVideo", {
-        chat_id: round.chat, video: location.telegramFileId, supports_streaming: true,
-        caption: `Раунд #${round.id} (до ${timeLabel.format(round.ends * 1000)} МСК)`,
-        reply_markup: { inline_keyboard: [[{
-          text: "Guess!", url: `https://t.me/${game.bot}?start=${roundLinkPrefix}${round.id}`,
-        }]] },
-      }) : await upload(env, location, round, source.body);
+      if (location.telegramFileId) {
+        const photo = location.mediaType === "photo";
+        const media = photo ? { photo: location.telegramFileId } : { video: location.telegramFileId, supports_streaming: true };
+        message = await telegram(env, photo ? "sendPhoto" : "sendVideo", { ...roundPost(round), ...media });
+      } else {
+        message = await upload(env, location, round, source.body);
+      }
     } catch (error) {
       const rejected = error instanceof ApiFailure && error.status >= 400 && error.status < 500;
       await db(env, "UPDATE rounds SET status=?,updated=? WHERE id=?",
@@ -480,6 +537,25 @@ async function publish(env, slot, end) {
 }
 
 const validUsername = (username) => typeof username === "string" && /^[a-z0-9_]{1,32}$/i.test(username);
+const clubMention = () => `<a href="${game.club.profile}">${game.club.name}</a>`;
+function roundPost(round) {
+  const deadline = timeLabel.formatToParts(round.ends * 1000)
+    .map(({ type, value }) => type === "hour" ? String(Number(value)) : value).join("");
+  const author = round.author_name && Number.isSafeInteger(round.author_user)
+    ? mention(round.author_user, round.author_name) : clubMention();
+  const caption = [
+    `Раунд #${round.id} (до ${deadline} МСК)`,
+    ...(round.difficulty == null ? [] : [`Сложность: ${round.difficulty}/5`]),
+    `От ${author}`,
+  ].join("\n");
+  return {
+    chat_id: round.chat, caption, parse_mode: "HTML",
+    reply_markup: { inline_keyboard: [[{
+      text: "Guess!", url: `https://t.me/${game.bot}?start=${roundLinkPrefix}${round.id}`,
+    }]] },
+  };
+}
+
 const mention = (user, name, username) => {
   const hasUsername = validUsername(username);
   const label = name?.trim() || (hasUsername ? "@" + username : "Игрок");
@@ -488,12 +564,14 @@ const mention = (user, name, username) => {
 };
 const googleMaps = (latitude, longitude) => `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${latitude},${longitude}`)}`;
 
-export function leaderboard(round, players, authorId) {
+export function leaderboard(round, players, ownerId) {
+  const authorUser = round.author_user ?? Number(ownerId);
   const author = round.author_points == null ? null : {
-    ...game.author, user: authorId, points: round.author_points, km: Infinity, submitted: Infinity,
+    name: round.author_name, user: authorUser, club: !round.author_name,
+    points: round.author_points, km: Infinity, submitted: Infinity,
   };
   const ranking = players
-    .filter((player) => !author || (String(player.user) !== authorId && player.username?.toLowerCase() !== author.username))
+    .filter((player) => !author || Number(player.user) !== authorUser)
     .map((player) => ({
       ...player, ...score(player.latitude, player.longitude, round.latitude, round.longitude),
     }));
@@ -502,7 +580,8 @@ export function leaderboard(round, players, authorId) {
 
   const heading = round.corrected ? `🛠 Исправление раунда #${round.id}` : `Раунд #${round.id} завершён.`;
   const lines = ranking.slice(0, 10).map((player, index) => {
-    const line = `${index + 1}. ${mention(player.user, player.name, player.username)} — ${player.points}`;
+    const name = player.club || String(player.user) === ownerId ? clubMention() : mention(player.user, player.name, player.username);
+    const line = `${index + 1}. ${name} — ${player.points}`;
     return index === 0 ? `<b>${line}</b>` : line;
   });
   return lines.length ? [heading, "", ...lines].join("\n") : heading;
@@ -517,7 +596,7 @@ function playerStats(rows) {
   const players = new Map();
   for (const row of rows) {
     if (!players.has(row.user)) {
-      players.set(row.user, { user: row.user, name: row.name, username: row.username, rounds: 0, total: 0 });
+      players.set(row.user, { user: row.user, name: row.name, username: row.username, club: row.club, rounds: 0, total: 0 });
     }
     const player = players.get(row.user);
     player.rounds++;
@@ -532,9 +611,9 @@ const byAccuracy = (a, b) => average(b) - average(a) || b.rounds - a.rounds || a
 
 function reportSection(heading, players, detail, mentions, empty) {
   const lines = players.slice(0, 3).map((player, index) => {
-    const { user, name, username } = player;
-    mentions?.push({ user, name, username });
-    return `${index + 1}. ${mention(user, name, username)} ${detail(player)}`;
+    const { user, name, username, club } = player;
+    mentions?.push({ user, name, username, ...(club ? { club: true } : {}) });
+    return `${index + 1}. ${club ? clubMention() : mention(user, name, username)} ${detail(player)}`;
   });
   return [`<b>${heading}:</b>`, ...(lines.length ? lines : [empty])].join("\n");
 }
@@ -595,9 +674,20 @@ export function monthlySummary(rows, mentions, start, end) {
 }
 
 async function reportGuesses(env, start, end) {
-  const { results } = await db(env, `SELECT g.user,g.name,g.username,g.submitted,g.points,g.latitude,g.longitude,
-    r.latitude AS target_latitude,r.longitude AS target_longitude FROM guesses g JOIN rounds r ON r.id=g.round
-    WHERE g.submitted>=? AND g.submitted<? ORDER BY g.submitted DESC,g.round DESC`, start, end).all();
+  const ownerId = Number(uploadOwner(env)) || null;
+  const { results } = await db(env, `SELECT * FROM (SELECT g.user,g.name,g.username,g.submitted,g.points,g.latitude,g.longitude,
+    r.latitude AS target_latitude,r.longitude AS target_longitude,g.round,g.user=? AS club
+    FROM guesses g JOIN rounds r ON r.id=g.round WHERE g.submitted>=? AND g.submitted<?
+      AND (r.author_points IS NULL OR g.user IS NOT COALESCE(r.author_user,?))
+    UNION ALL
+    SELECT COALESCE(r.author_user,?),r.author_name,NULL,
+      COALESCE(CAST(strftime('%s',substr(r.slot,instr(r.slot,':')+1) || CASE
+        WHEN r.slot LIKE 'morning:%' THEN ' 07:00:00' WHEN r.slot LIKE 'evening:%' THEN ' 17:00:00' END) AS INTEGER),r.ends-1),
+      r.author_points,r.latitude,r.longitude,r.latitude,r.longitude,r.id,
+      r.author_name IS NULL OR r.author_user=?
+    FROM rounds r WHERE r.status='closed' AND r.author_points IS NOT NULL AND COALESCE(r.author_user,?) IS NOT NULL
+    ) WHERE submitted>=? AND submitted<? ORDER BY submitted DESC,round DESC`,
+  ownerId, start, end, ownerId, ownerId, ownerId, ownerId, start, end).all();
   return results;
 }
 
@@ -615,7 +705,8 @@ async function prepareMonthlyReport(env, start, end, now) {
     db(env, "SELECT mentions FROM weekly_reports WHERE status='sent' AND updated>=? AND updated<? ORDER BY updated DESC",
       start, end).all(),
   ]);
-  const mentions = reports.results.flatMap((report) => JSON.parse(report.mentions));
+  const mentions = reports.results.flatMap((report) => JSON.parse(report.mentions))
+    .map((entry) => String(entry.user) === uploadOwner(env) ? { ...entry, club: true } : entry);
   await db(env, "INSERT OR IGNORE INTO monthly_reports(month_start,text,status,updated) VALUES(?,?,'pending',?)",
     start, monthlySummary(rows, mentions, start, end), now).run();
 }
@@ -651,7 +742,7 @@ async function publishReport(env, now, window, table, key, prepare) {
 
 async function inventory(env) {
   const direct = await telegramInventory(env);
-  if (!driveMediaEnabled(env)) return `Остаток видео для новых раундов\nГотовы: ${direct}\nИсточник: Telegram (locations).`;
+  if (!driveMediaEnabled(env)) return `Остаток панорам для новых раундов\nГотовы: ${direct}\nИсточник: Telegram.`;
   try { return `В Telegram готовы: ${direct}\n` + await driveInventory(env); }
   catch (error) {
     logFailure("Drive inventory")(error);
@@ -675,7 +766,7 @@ async function delivery(env, item) {
     return { method: "sendMessage", body: { chat_id: chatId, text: await inventory(env) } };
   }
   if (item.kind === "result") return null;
-  const row = await db(env, `SELECT r.id,r.latitude,r.longitude,r.author_points,g.name,g.username,g.points,g.distance,
+  const row = await db(env, `SELECT r.id,r.latitude,r.longitude,r.author_points,r.author_user,r.author_name,g.name,g.username,g.points,g.distance,
     g.latitude AS guess_latitude,g.longitude AS guess_longitude,
     EXISTS(SELECT 1 FROM settings WHERE key='correction:' || r.id) AS corrected
     FROM rounds r LEFT JOIN guesses g ON g.round=r.id AND g.user=? WHERE r.id=?`, item.user, item.round).first();
@@ -689,7 +780,7 @@ async function delivery(env, item) {
 
   let text;
   if (item.kind === "guess") {
-    const name = mention(item.user, row.name, row.username);
+    const name = String(item.user) === uploadOwner(env) ? clubMention() : mention(item.user, row.name, row.username);
     if (!showGuessDetails(env, item.round)) {
       text = `${name} сделал guess в раунде #${item.round}`;
     } else {
@@ -702,9 +793,14 @@ async function delivery(env, item) {
     }
   } else {
     const players = (await db(env, "SELECT user,name,username,latitude,longitude,submitted FROM guesses WHERE round=?", item.round).all()).results;
-    text = leaderboard(row, players, firstAdmin(env));
+    text = leaderboard(row, players, uploadOwner(env)) + "\n\nОцените панораму";
   }
-  return { method: "sendMessage", body: { chat_id: chatId, text, parse_mode: "HTML", link_preview_options: { is_disabled: true } } };
+  const rating = item.kind === "reveal" ? { reply_markup: { inline_keyboard: [[
+    { text: "❤️", callback_data: `panorama_vote:${item.round}:1` },
+    { text: "💔", callback_data: `panorama_vote:${item.round}:-1` },
+  ]] } } : {};
+  return { method: "sendMessage", body: { chat_id: chatId, text, parse_mode: "HTML",
+    link_preview_options: { is_disabled: true }, ...rating } };
 }
 
 async function flush(env, budget = 10) {
@@ -784,6 +880,7 @@ export async function resetTestRounds(env) {
     db(env, `DELETE FROM outbox WHERE ${canReset}`),
     db(env, `DELETE FROM selected WHERE ${canReset}`),
     db(env, `DELETE FROM guesses WHERE ${canReset}`),
+    db(env, `DELETE FROM panorama_votes WHERE ${canReset}`),
     db(env, `DELETE FROM rounds WHERE ${canReset}`),
     db(env, `DELETE FROM settings WHERE (key='drive_cursor_v2' OR key LIKE 'correction:%') AND ${canReset}`),
     db(env, `INSERT INTO settings SELECT 'club_launched','1' WHERE ${canReset}`),
@@ -792,10 +889,36 @@ export async function resetTestRounds(env) {
 }
 
 async function admin(env, ctx, message, command, args, updateId) {
-  if (!String(env.ADMIN_IDS || "").split(/[,\s]+/).includes(String(message.from.id))) {
+  if (!isPanoramaAdmin(env, message.from.id)) {
     return reply(message, "Эта команда доступна администраторам.");
   }
   switch (command) {
+    case "/moderation": {
+      const { results } = await db(env, `SELECT m.user,a.username FROM panorama_mutes m
+        LEFT JOIN panorama_authors a ON a.user=m.user ORDER BY m.muted_at DESC,m.user LIMIT 20`).all();
+      const list = results.map(({ user, username }) => username ? `@${username} (${user})` : String(user));
+      return reply(message, ["/mute ID или @username — отключить добавление.",
+        "/unmute ID или @username — вернуть доступ.",
+        list.length ? "Последние ограничения:\n" + list.join("\n") : "Активных ограничений нет."].join("\n"));
+    }
+    case "/mute":
+    case "/unmute": {
+      const handle = /^@([a-z0-9_]{1,32})$/i.exec(args);
+      const target = validId(args) ? Number(args) : handle
+        ? await db(env, "SELECT user FROM panorama_authors WHERE username=?", handle[1].toLowerCase()).first("user")
+        : null;
+      if (!target) return reply(message, `Используй ${command} Telegram_ID или ${command} @username. Ник можно найти после /add.`);
+      if (isPanoramaAdmin(env, target)) return reply(message, "Эта команда действует на участников клуба.");
+      if (command === "/unmute") {
+        await db(env, "DELETE FROM panorama_mutes WHERE user=?", target).run();
+        return reply(message, `Добавление панорам для ${target} снова доступно.`);
+      }
+      await env.DB.batch([
+        db(env, "INSERT INTO panorama_mutes VALUES(?,?,?) ON CONFLICT(user) DO NOTHING", target, message.from.id, clock()),
+        db(env, "DELETE FROM location_upload_sessions WHERE user=?", target),
+      ]);
+      return reply(message, `Добавление панорам для ${target} отключено. Вернуть доступ — /unmute ${target}.`);
+    }
     case "/reset_test_rounds": {
       if (!env.TELEGRAM_CHANNEL || env.TELEGRAM_CHANNEL === game.chat) {
         return reply(message, "Сначала укажи новую группу.");
@@ -838,7 +961,7 @@ async function admin(env, ctx, message, command, args, updateId) {
       }
     }
     case "/sync": {
-      if (env.MEDIA_SOURCE === "telegram") return reply(message, "Видео хранятся в Telegram. Добавление — /add, остаток — /inventory. Синхронизация с Drive не нужна.");
+      if (env.MEDIA_SOURCE === "telegram") return reply(message, "Панорамы хранятся в Telegram. Добавление — /add, остаток — /inventory. Синхронизация с Drive не нужна.");
       try {
         await verifyDrive(env);
         const location = await chooseLocation(env);
@@ -913,23 +1036,43 @@ async function admin(env, ctx, message, command, args, updateId) {
   }
 }
 
+async function panoramaVote(env, callback, updateId) {
+  if (!callback.id || !Number.isSafeInteger(callback.from?.id) || !Number.isSafeInteger(updateId)) return okay();
+  const match = /^panorama_vote:(\d{1,15}):(-?1)$/.exec(callback.data || "");
+  if (!match || !validId(match[1])) return okay();
+  const roundId = Number(match[1]);
+  const vote = Number(match[2]);
+  const messageId = callback.message?.message_id;
+  const reveal = Number.isSafeInteger(messageId) && await db(env, `SELECT 1 FROM rounds r JOIN outbox o ON o.round=r.id
+    WHERE r.id=? AND r.status='closed' AND o.kind='reveal' AND o.status='sent' AND o.message_id=?`, roundId, messageId).first();
+  if (reveal) {
+    await db(env, `INSERT INTO panorama_votes VALUES(?,?,?,?,?) ON CONFLICT(round,user) DO UPDATE SET
+      vote=excluded.vote,updated=excluded.updated,update_id=excluded.update_id WHERE excluded.update_id>panorama_votes.update_id`,
+    roundId, callback.from.id, vote, clock(), updateId).run();
+  }
+  return Response.json({ method: "answerCallbackQuery", callback_query_id: callback.id,
+    text: reveal ? "Голос сохранён." : "Этот раунд сейчас нельзя оценить." });
+}
+
 async function webhook(env, ctx, request) {
   if (!env.WEBHOOK_SECRET || request.headers.get("X-Telegram-Bot-Api-Secret-Token") !== env.WEBHOOK_SECRET) {
     return new Response("Forbidden", { status: 403 });
   }
   let update;
   try { update = await request.json(); } catch { return new Response("Bad request", { status: 400 }); }
+  if (update.callback_query) return panoramaVote(env, update.callback_query, update.update_id);
   const message = update.message;
   if (message?.chat?.type !== "private" || !Number.isSafeInteger(message.from?.id)) return okay();
   const user = message.from.id;
   const [raw, ...tokens] = (message.text || "").trim().split(/\s+/);
   const args = tokens.join(" ");
   const command = raw.startsWith("/") ? raw.split("@")[0] : "";
-  const addition = await addLocation(env, message, command, coordinates, weekCoverageText);
+  if (["/moderation", "/mute", "/unmute"].includes(command)) return admin(env, ctx, message, command, args, update.update_id);
+  const addition = await addLocation(env, message, command, locationPoint, weekCoverageText);
   if (addition !== null) return reply(message, addition);
 
   if (command === "/start") {
-    if (!args) return reply(message, `Открой раунд по кнопке под постом в группе.\n\nТвой Telegram ID: ${user}`);
+    if (!args) return reply(message, `Открой раунд по кнопке под постом в группе. Хочешь предложить панораму? Напиши /add.\n\nТвой Telegram ID: ${user}`);
     const suffix = args.startsWith(roundLinkPrefix) ? args.slice(roundLinkPrefix.length) : "";
     const id = validId(suffix) ? Number(suffix) : 0;
     const round = await db(env, "SELECT * FROM rounds WHERE id=?", id).first();
@@ -939,6 +1082,9 @@ async function webhook(env, ctx, request) {
     }
     await db(env, "INSERT INTO selected VALUES(?,?) ON CONFLICT(user) DO UPDATE SET round=excluded.round", user, id).run();
     if (round.status !== "active" || clock() >= round.ends) return reply(message, expired);
+    if (round.author_points != null && (round.author_user ?? Number(uploadOwner(env))) === user) {
+      return reply(message, `Твой авторский результат уже учтён: ${round.author_points} / 5000.`);
+    }
     if (await db(env, "SELECT 1 FROM guesses WHERE round=? AND user=?", id, user).first()) return reply(message, duplicate);
     return reply(message, `Раунд #${id}. Открой «Вложения → Геопозиция», выбери точку на карте и отправь её сюда.`);
   }
@@ -955,6 +1101,9 @@ async function webhook(env, ctx, request) {
   const name = [message.from.first_name, message.from.last_name].filter(Boolean).join(" ");
   const now = clock();
   if (round.status !== "active" || round.ends <= now) return reply(message, expired);
+  if (round.author_points != null && (round.author_user ?? Number(uploadOwner(env))) === user) {
+    return reply(message, `Твой авторский результат уже учтён: ${round.author_points} / 5000.`);
+  }
   const { km, points } = score(point.latitude, point.longitude, round.latitude, round.longitude);
   const stored = await db(env, `INSERT INTO guesses(round,user,name,latitude,longitude,announcement,submitted,username,distance,points)
     SELECT id,?,?,?,?,?,?,?,?,? FROM rounds WHERE id=? AND status='active' AND ends>?

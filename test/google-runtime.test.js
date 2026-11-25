@@ -33,9 +33,9 @@ test('Google runtime retains location upload, a single guess, scoring and idempo
   const { core, env, sent, sqlite, request, owner, snapshots } = fixture();
   const ctx = { waitUntil: value => value };
   for (const message of [owner(1, { text: '/add' }), owner(2, { video: { file_id: 'video-token', file_unique_id: 'video-unique', file_size: 50000000 } }),
-    owner(3, { text: '55.75, 37.61' }), owner(4, { text: '4500' }), owner(5, { text: '/done' })]) core.webhook(env, ctx, request(message));
+    owner(3, { text: '55.75, 37.61' }), owner(4, { text: '3' }), owner(5, { text: '4500' }), owner(6, { text: '/done' })]) core.webhook(env, ctx, request(message));
   assert.equal(env.DB.prepare('SELECT COUNT(*) AS n FROM locations').first('n'), 1);
-  core.webhook(env, ctx, request(owner(4, { text: '4500' })));
+  core.webhook(env, ctx, request(owner(5, { text: '4500' })));
   assert.equal(env.DB.prepare('SELECT COUNT(*) AS n FROM locations').first('n'), 1);
   const end = Math.floor(Date.now() / 1000) + 300;
   core.publish(env, 'manual:test', end);
@@ -69,9 +69,9 @@ test('Telegram-only mode ignores legacy Drive credentials, including an empty qu
   env.DRIVE_SERVICE_ACCOUNT = '{invalid legacy configuration';
   const ctx = { waitUntil: value => value };
   for (const message of [owner(1, { text: '/add' }), owner(2, { video: { file_id: 'telegram-only-video', file_unique_id: 'telegram-only-unique' } }),
-    owner(3, { location: { latitude: 55.75, longitude: 37.61 } }), owner(4, { text: '4500' }), owner(5, { text: '/done' })]) core.webhook(env, ctx, request(message));
+    owner(3, { location: { latitude: 55.75, longitude: 37.61 } }), owner(4, { text: '3' }), owner(5, { text: '4500' }), owner(6, { text: '/done' })]) core.webhook(env, ctx, request(message));
   assert.match(core.inventory(env), /Готовы: 1/);
-  assert.match(core.webhook(env, ctx, request(owner(6, { text: '/sync' }))).data.text, /Синхронизация с Drive не нужна/);
+  assert.match(core.webhook(env, ctx, request(owner(7, { text: '/sync' }))).data.text, /Синхронизация с Drive не нужна/);
   const restored = new SQL.Database(snapshots.at(-1));
   env.DB = new core.GoogleDatabase(restored, () => {});
   core.publish(env, 'manual:telegram-only', Math.floor(Date.now() / 1000) + 300);
@@ -94,12 +94,12 @@ test('Google database rolls back a failed multi-statement operation without pers
   sqlite.close();
 });
 
-test('Google transformed webhook still denies unauthorized requests and owners', () => {
+test('Google transformed webhook accepts only authenticated updates', () => {
   const { core, env, request, owner, sqlite } = fixture();
   const response = core.webhook(env, { waitUntil() {} }, { headers: { get: () => 'wrong' }, json: () => { throw new Error('must not parse'); } });
   assert.equal(response.status, 403);
   const reply = core.webhook(env, { waitUntil() {} }, request({ ...owner(1, { text: '/add' }), from: { id: 99 } }));
-  assert.match(reply.data.text, /владельцу/);
+  assert.match(reply.data.text, /включён/);
   sqlite.close();
 });
 
@@ -107,7 +107,7 @@ test('migration preserves Telegram IDs and notifications without executing impor
   const source = fixture(), destination = fixture();
   const ctx = { waitUntil: value => value };
   for (const message of [source.owner(1, { text: '/add' }), source.owner(2, { video: { file_id: 'persistent-telegram-video', file_unique_id: 'persistent-unique' } }),
-    source.owner(3, { text: '55.75, 37.61' }), source.owner(4, { text: '4500' })]) source.core.webhook(source.env, ctx, source.request(message));
+    source.owner(3, { text: '55.75, 37.61' }), source.owner(4, { text: '4' }), source.owner(5, { text: '4500' })]) source.core.webhook(source.env, ctx, source.request(message));
   source.core.publish(source.env, 'manual:migration', Math.floor(Date.now() / 1000) + 300);
   const names = ['rounds','guesses','selected','settings','outbox','prepared_media','retired_locations','weekly_reports','monthly_reports','locations','location_upload_sessions'];
   const data = { version: 1, env: { BOT_TOKEN: 'private-test-token', WEBHOOK_SECRET: 'private-test-secret' },
@@ -143,4 +143,22 @@ test('Telegram acknowledgement uses a direct HTML response rather than a content
   const ack = vm.runInContext('telegramAck_()', sandbox);
   assert.equal(ack.http, 200);
   assert.equal(ack.body, 'OK');
+});
+
+test('an existing Apps Script database keeps Telegram media and drafts during the feature migration', () => {
+  const { core, sqlite } = fixture();
+  sqlite.close();
+  const old = new SQL.Database();
+  old.run(build.schema.split("ALTER TABLE locations ADD COLUMN media_type")[0]);
+  old.run("INSERT INTO locations VALUES('unique','old-telegram-id',55,37,3400,1,123)");
+  old.run("INSERT INTO location_upload_sessions VALUES(1,'points',234,'pending-id','pending-unique',12,14)");
+  let persisted = 0;
+  const db = new core.GoogleDatabase(old, () => persisted++);
+  assert.equal(db.prepare("SELECT file_id FROM locations").first("file_id"), "old-telegram-id");
+  assert.equal(db.prepare("SELECT media_type FROM locations").first("media_type"), "video");
+  assert.equal(db.prepare("SELECT file_id FROM location_upload_sessions").first("file_id"), "pending-id");
+  assert.equal(db.prepare("SELECT step FROM location_upload_sessions").first("step"), "points");
+  new core.GoogleDatabase(old, () => persisted++);
+  assert.equal(persisted, 1);
+  old.close();
 });

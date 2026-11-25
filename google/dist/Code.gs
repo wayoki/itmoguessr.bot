@@ -107,7 +107,12 @@ function googleRuntime_() {
     if (text.length > 8000000) throw new Error('Database exceeds the reviewed Google runtime size limit');
     driveWrite_(env.DATA_FILE_ID, text);
   };
-  env.DB = new core.GoogleDatabase(sqlite, persist);
+  try {
+    env.DB = new core.GoogleDatabase(sqlite, persist);
+  } catch (error) {
+    sqlite.close();
+    throw error;
+  }
   env.MEDIA = { get: () => { throw new Error('Upload videos directly to the bot with /add'); } };
   if (!env.DRIVE_SERVICE_ACCOUNT) env.DRIVE_SERVICE_ACCOUNT = '';
   return { env, core, sqlite, persist };
@@ -122,7 +127,7 @@ function withGoogleRuntime_(action) {
 function verifyGoogleBot() {
   return withGoogleRuntime_(runtime => {
     const count = name => runtime.env.DB.prepare('SELECT COUNT(*) AS n FROM ' + name).first('n');
-    console.log(JSON.stringify({ ready: true, active: runtime.env.GOOGLE_BOT_ACTIVE === 'true', rounds: count('rounds'), guesses: count('guesses'), locations: count('locations') }));
+    console.log(JSON.stringify({ ready: true, active: runtime.env.GOOGLE_BOT_ACTIVE === 'true', rounds: count('rounds'), guesses: count('guesses'), locations: count('locations'), panoramaVotes: count('panorama_votes'), sourceCommit: runtime.env.SOURCE_COMMIT }));
   });
 }
 function scheduledCheck() {
@@ -227,15 +232,19 @@ function googlePlatform() {
         headers: { Authorization: 'Bearer ' + cachedToken },
       }), Failure, 'Google Drive');
     },
-    upload: (env, location, round, source, Failure) => {
+    mapsRedirect: url => {
+      const response = request(url, { followRedirects: false });
+      const status = response.getResponseCode();
+      if (status < 300 || status >= 400) return null;
+      const headers = response.getHeaders();
+      return headers.Location || headers.location || null;
+    },
+    upload: (env, location, round, source, Failure, post) => {
       const field = location.format[1];
       const blob = source.blob;
       if (!blob || blob.getBytes().length > 30000000) throw new Error('Prepared media is missing or exceeds the Google upload limit');
       blob.setName('round-' + round.id + '.' + location.format[2]);
-      const payload = {
-        chat_id: round.chat, caption: 'Раунд #' + round.id + ' (до ' + Utilities.formatDate(new Date(round.ends * 1000), 'Europe/Moscow', 'dd.MM, H:mm') + ' МСК)',
-        reply_markup: JSON.stringify({ inline_keyboard: [[{ text: 'Guess!', url: 'https://t.me/itmoguessr_bot?start=round_v2_' + round.id }]] }),
-      };
+      const payload = { ...post, reply_markup: JSON.stringify(post.reply_markup) };
       payload[field] = blob;
       if (field === 'video') payload.supports_streaming = 'true';
       return send(env, location.format[0], payload, Failure);

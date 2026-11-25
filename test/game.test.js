@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
-import worker, { activeSlots, coordinates, filenameCoordinates, filenameLocation, leaderboard, monthlyWindow, multipart, resetTestRounds, score, weeklySummary, weeklyWindow, remainingWeekSlots, weekCoverage, weekCoverageText } from "../index.js";
+import worker, { activeSlots, coordinates, mapsCoordinates, filenameCoordinates, filenameLocation, leaderboard, monthlyWindow, multipart, resetTestRounds, score, weeklySummary, weeklyWindow, remainingWeekSlots, weekCoverage, weekCoverageText } from "../index.js";
 
 const clubMigration = "0003_start_club_rounds.sql";
 const authorPointsMigration = "0006_round_author_points.sql";
@@ -35,8 +35,10 @@ function database() {
       const operation = batchTail.then(async () => {
       sql.exec("BEGIN");
       try {
-        for (const statement of statements) await statement.run();
+        const results = [];
+        for (const statement of statements) results.push(await statement.run());
         sql.exec("COMMIT");
+        return results;
       } catch (error) {
         sql.exec("ROLLBACK");
         throw error;
@@ -154,7 +156,7 @@ test("webhook enforces secret and accepts a single guess, then reveals once", as
   const request = (url, headers, data) => worker.fetch(new Request("https://bot.example" + url, {
     method: "POST", headers, body: JSON.stringify(data),
   }), env, ctx);
-  const tg = (data, user = 42, secret = "secret") => request("/telegram", { "X-Telegram-Bot-Api-Secret-Token": secret }, {
+  const tg = (data, user = 44, secret = "secret") => request("/telegram", { "X-Telegram-Bot-Api-Secret-Token": secret }, {
     update_id: 10, message: { from: { id: user, first_name: "<Игрок>", username: "test_player" }, chat: { type: "private", id: user }, ...data },
   });
   const now = Math.floor(Date.now() / 1000);
@@ -174,7 +176,7 @@ test("webhook enforces secret and accepts a single guess, then reveals once", as
   assert.doesNotMatch(sent[0].text, /48\.8566|2\.3522|maps/);
 
   assert.match((await (await tg({ text: "/close 1" }, 43)).json()).text, /администраторам/);
-  assert.match((await (await tg({ text: "/close 1" })).json()).text, /закрыт/);
+  assert.match((await (await tg({ text: "/close 1" }, 42)).json()).text, /закрыт/);
   await Promise.all(tasks.splice(0));
   assert.equal(sent.length, 4);
   assert.equal(sql.prepare("SELECT count(*) AS n FROM outbox WHERE kind='result'").get().n, 0);
@@ -182,7 +184,7 @@ test("webhook enforces secret and accepts a single guess, then reveals once", as
   assert.equal(map.latitude, 48.8566);
   assert.match(map.reply_markup.inline_keyboard[0][0].url, /^https:\/\/www.google.com\/maps/);
   const rank = sent.find(({ text }) => text?.includes("Раунд #1 завершён."));
-  assert.match(rank.text, /^Раунд #1 завершён\.\n\n<b>1\. .*Игрок.*5000<\/b>$/);
+  assert.match(rank.text, /^Раунд #1 завершён\.\n\n<b>1\. .*Игрок.*5000<\/b>\n\nОцените панораму$/);
   const maintenance = () => request("/mcp", { "oai-authenticated-user-email": "owner@example.test" },
     { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "run_training_schedule" } });
   assert.equal((await (await maintenance()).json()).result.isError, undefined);
@@ -190,7 +192,7 @@ test("webhook enforces secret and accepts a single guess, then reveals once", as
   assert.match((await (await tg(point)).json()).text, /приём ответов.*закрыт/i);
   assert.equal(sql.prepare("SELECT points FROM guesses").get().points, 5000);
   assert.match((await (await tg({ text: "/correct 1 56.62567, 23.34348" }, 43)).json()).text, /администраторам/);
-  assert.match((await (await tg({ text: "/correct 1 56.62567, 23.34348" })).json()).text, /исправлена/);
+  assert.match((await (await tg({ text: "/correct 1 56.62567, 23.34348" }, 42)).json()).text, /исправлена/);
   await Promise.all(tasks.splice(0));
   const corrections = sent.slice(4);
   assert.equal(corrections.length, 2);
@@ -198,7 +200,7 @@ test("webhook enforces secret and accepts a single guess, then reveals once", as
   assert.equal(corrections[0].longitude, 23.34348);
   assert.ok(corrections.slice(1).every(({ text }) => text.includes("Исправление раунда #1")));
   assert.doesNotMatch(corrections[1].text, /5000/);
-  assert.match((await (await tg({ text: "/correct 1 56.62567, 23.34348" })).json()).text, /уже сохранены/);
+  assert.match((await (await tg({ text: "/correct 1 56.62567, 23.34348" }, 42)).json()).text, /уже сохранены/);
   await Promise.all(tasks.splice(0));
   assert.equal(sent.length, 6);
   sql.close();
@@ -298,7 +300,7 @@ test("random selection reaches the second Drive page and keeps the filename scor
   assert.equal(second.author_points, null);
   assert.match((await (await command("/close 1", 7)).json()).text, /закрыт/);
   await Promise.all(background.splice(0));
-  assert.match(telegramTexts.find((text) => text.startsWith("Раунд #1 завершён.")), /1\. <a href="https:\/\/t\.me\/wayoki\?profile">макс\.<\/a> — 4321/);
+  assert.match(telegramTexts.find((text) => text.startsWith("Раунд #1 завершён.")), /1\. <a href="https:\/\/t\.me\/itmoguessr">ITMOGUESSR\*<\/a> — 4321/);
   sql.close();
 });
 
@@ -319,12 +321,11 @@ test("the author's filename score ranks with the players and appears only in the
   const round = { id: 5, latitude: 0, longitude: 0, author_points: 5000 };
   const players = [
     { user: 42, name: "Owner's guess", latitude: 0, longitude: 0, submitted: 1 },
-    { user: 43, username: "WAYOKI", name: "Owner's alternate entry", latitude: 0, longitude: 0, submitted: 1 },
     { user: 44, name: "Exact", latitude: 0, longitude: 0, submitted: 2 },
     { user: 45, name: "Far", latitude: 0, longitude: 1, submitted: 2 },
   ];
   const ranked = leaderboard(round, players, "42");
-  assert.match(ranked, /1\. .*Exact.*5000<\/b>\n2\. .*макс\..*5000\n3\. .*Far/);
+  assert.match(ranked, /1\. .*Exact.*5000<\/b>\n2\. .*ITMOGUESSR\*.*5000\n3\. .*Far/);
   assert.doesNotMatch(ranked, /Owner/);
 
   const topPlayers = Array.from({ length: 12 }, (_, i) => ({
@@ -349,7 +350,7 @@ test("club reset clears test rounds and players once, preserves the pause and ex
     assert.equal(sql.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count, 0);
   }
   assert.equal(sql.prepare("SELECT folder FROM retired_locations").get().folder, "file:old");
-  assert.deepEqual(sql.prepare("SELECT key FROM settings ORDER BY key").all().map(row => row.key), ["club_launched", "paused"]);
+  assert.deepEqual(sql.prepare("SELECT key FROM settings ORDER BY key").all().map(row => row.key), ["club_launched", "paused", "schema:community_panoramas"]);
   sql.exec("INSERT INTO rounds(slot,folder,latitude,longitude,chat,ends,status,updated) VALUES('new-slot','file:new',40,20,'@new',30,'active',31)");
   assert.equal(await resetTestRounds({ DB }), true);
   assert.equal(sql.prepare("SELECT id FROM rounds").get().id, 1);
@@ -595,12 +596,14 @@ test("owner repeatedly adds 50 MB panoramas, preserving coordinates and author s
   const { send } = uploadHarness(DB);
   assert.match((await send({ text: "/add@itmoguessr_bot" })).text, /включён/);
   assert.match((await send(testVideo())).text, /координаты/);
-  assert.match((await send({ text: "55.7558, 37.6173" })).text, /очков/);
+  assert.match((await send({ text: "55.7558, 37.6173" })).text, /сложность/);
+  assert.match((await send({ text: "2" })).text, /очков/);
   assert.match((await send({ text: "2305" })).text, /Сохранено.*55.7558, 37.6173/);
   assert.equal(sql.prepare("SELECT author_points FROM locations").get().author_points, 2305);
   // A fresh handler invocation reads the persisted mode, not in-memory state.
   assert.match((await send(testVideo("second"))).text, /координаты/);
   await send({ location: { latitude: -10, longitude: 0 } });
+  await send({ text: "5" });
   assert.match((await send({ text: "0" })).text, /0 \/ 5000/);
   assert.equal(sql.prepare("SELECT count(*) AS n FROM locations").get().n, 2);
   await send({ text: "/done" });
@@ -608,16 +611,14 @@ test("owner repeatedly adds 50 MB panoramas, preserving coordinates and author s
   sql.close();
 });
 
-test("upload mode rejects other admins, group chats and unauthorized webhook requests", async () => {
+test("upload mode accepts participants in private chats and rejects unauthorized webhook requests", async () => {
   const { sql, DB } = database();
   const { send } = uploadHarness(DB);
-  assert.match((await send({ text: "/add" }, 43)).text, /только владельцу/);
   assert.equal(await send({ text: "/add" }, 42, { chatType: "group" }), "OK");
   assert.equal(await send({ text: "/add" }, 42, { secret: "wrong" }), "Forbidden");
   assert.equal(sql.prepare("SELECT count(*) AS n FROM location_upload_sessions").get().n, 0);
-  const custom = uploadHarness(DB, { LOCATION_OWNER_ID: "44" });
-  assert.match((await custom.send({ text: "/add" }, 42)).text, /только владельцу/);
-  assert.match((await custom.send({ text: "/add" }, 44)).text, /включён/);
+  assert.match((await send({ text: "/add" }, 100)).text, /включён/);
+  assert.equal(sql.prepare("SELECT user FROM location_upload_sessions").get().user, 100);
   sql.close();
 });
 
@@ -636,6 +637,8 @@ test("upload validation, cancellation and retry never create duplicate or unfini
   }
   assert.match((await send({ location: { latitude: 0, longitude: 0, live_period: 60 } })).text, /Не распознал/);
   await send({ text: "0, 0" });
+  for (const value of ["0", "6", "3.5"]) assert.match((await send({ text: value })).text, /сложность/);
+  await send({ text: "3" });
   for (const value of ["-1", "5001", "2.5", "hello"]) assert.match((await send({ text: value })).text, /Нужно целое/);
   const scoreId = sql.prepare("SELECT last_message FROM location_upload_sessions").get().last_message + 20;
   await Promise.all([send({ text: "5000" }, 42, { id: scoreId }), send({ text: "5000" }, 42, { id: scoreId })]);
@@ -663,6 +666,7 @@ test("Telegram locations publish once without Drive and retain author points for
   await send({ text: "/add" });
   await send(testVideo());
   await send({ text: "55.7558, 37.6173" });
+  await send({ text: "4" });
   await send({ text: "3210" });
   await send({ text: "/done" });
   assert.match((await send({ text: "/inventory" })).text, /Готовы: 1/);
@@ -671,6 +675,7 @@ test("Telegram locations publish once without Drive and retain author points for
   const video = sent.find((item) => item.method === "sendVideo");
   assert.equal(video.video, "telegram-file-panorama");
   assert.doesNotMatch(JSON.stringify(video), /55\.7558|37\.6173|3210/);
+  assert.match(video.caption, /Сложность: 4\/5.*\nОт .*ITMOGUESSR\*/);
   assert.match(video.reply_markup.inline_keyboard[0][0].url, /round_v2_1/);
   const round = sql.prepare("SELECT * FROM rounds").get();
   assert.equal(round.status, "active");
@@ -711,7 +716,7 @@ test("weekly stock subtracts reserved scheduled rounds and counts each unused po
   insertRound.run(2, "evening:2026-11-20", "reserved", now + 100, "publishing", now);
   insertRound.run(3, "morning:2026-11-21", "rejected", now + 100, "failed", now);
   insertRound.run(4, "manual:4", "manual", now + 100, "closed", now);
-  const insert = sql.prepare("INSERT INTO locations VALUES(?,?,?,?,5000,42,?)");
+  const insert = sql.prepare("INSERT INTO locations(file_unique_id,file_id,latitude,longitude,author_points,owner,created) VALUES(?,?,?,?,5000,42,?)");
   insert.run("one", "file-one", 1, 1, now);
   insert.run("duplicate-point", "file-duplicate", 1, 1, now);
   insert.run("used-point", "file-used", 0, 0, now);
@@ -732,6 +737,7 @@ test("every saved video updates the Sunday deficit and the last one confirms cov
   for (let i = 1; i <= 5; i++) {
     await send(testVideo("week-" + i));
     await send({ text: `${i}, 10` });
+    await send({ text: "1" });
     const result = (await send({ text: "2305" })).text;
     assert.match(result, /воскресенья \(22\.11\).*20:00 МСК/);
     if (i < 5) assert.ok(result.includes(`Осталось загрузить видео: ${5 - i}.`));
@@ -777,7 +783,7 @@ test("weekly stock merges Drive pages, prepared media and Telegram without count
     ] });
   });
   sql.prepare(`INSERT INTO rounds(${roundColumns}) VALUES(1,'morning:2026-11-20','already',0,0,'@club',?,NULL,'active',?)`).run(now + 100, now);
-  sql.prepare("INSERT INTO locations VALUES('telegram','file',1,1,3000,42,?)").run(now);
+  sql.prepare("INSERT INTO locations(file_unique_id,file_id,latitude,longitude,author_points,owner,created) VALUES('telegram','file',1,1,3000,42,?)").run(now);
   sql.prepare("INSERT INTO prepared_media VALUES('prepared','1','key',5000000,1920,1080,25,?)").run(now);
   const result = await weekCoverage({ DB, DRIVE_ROOT: "stock-root", DRIVE_SERVICE_ACCOUNT: JSON.stringify({
     type: "service_account", client_email: "test@example.test", private_key: pem,
@@ -795,10 +801,79 @@ test("a failed Drive check never loses a saved video or presents its deficit as 
   await send({ text: "/add" });
   await send(testVideo());
   await send({ text: "1, 1" });
+  await send({ text: "2" });
   const result = (await send({ text: "2305" })).text;
-  assert.match(result, /Сохранено в locations/);
+  assert.match(result, /Сохранено/);
   assert.match(result, /Без учёта непроверенной части Google Drive.*4/);
   assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM locations").get().n, 1);
   assert.equal(sql.prepare("SELECT step FROM location_upload_sessions").get().step, "video");
+  sql.close();
+});
+
+test("Google Maps pin coordinates take priority over the camera and unsupported links are ignored", () => {
+  assert.deepEqual(mapsCoordinates("https://www.google.com/maps/place/Place/@55.7,37.6,13z/data=!3d54.2!4d36.21"), [54.2, 36.21]);
+  assert.deepEqual(mapsCoordinates("https://www.google.com/maps/search/?api=1&query=-55.5%2C%2037.1"), [-55.5, 37.1]);
+  assert.equal(mapsCoordinates("https://www.google.com.bad.test/maps/@54.2,36.21,13z"), null);
+  assert.equal(mapsCoordinates("https://www.google.com/maps?q=91,37"), null);
+});
+
+test("participant photo, creator score, club guess, moderation and editable votes work together", async (t) => {
+  const { sql, DB } = database();
+  const sent = [];
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    if (url === "https://maps.app.goo.gl/shortPin") {
+      assert.equal(options.redirect, "manual");
+      return new Response(null, { status: 302, headers: { location: "https://www.google.com/maps?q=55.7,37.6" } });
+    }
+    assert.match(url, /^https:\/\/api.telegram.org\/bot/);
+    sent.push({ method: url.split("/").at(-1), ...JSON.parse(options.body) });
+    return Response.json({ ok: true, result: { message_id: sent.length + 100 } });
+  });
+  const { env, send, tasks } = uploadHarness(DB);
+  const author = { from: { id: 121, username: "MapMaker", first_name: "<Ира>" } };
+  await send({ ...author, text: "/add" }, 121);
+  await send({ ...author, photo: [
+    { file_id: "thumb", file_unique_id: "small" }, { file_id: "photo", file_unique_id: "big" },
+  ] }, 121);
+  await send({ ...author, text: "https://maps.app.goo.gl/shortPin" }, 121);
+  await send({ ...author, text: "5" }, 121);
+  assert.match((await send({ ...author, text: "4321" }, 121)).text, /4321 \/ 5000/);
+  assert.match((await send({ text: "/mute 121" }, 122)).text, /администраторам/);
+  assert.match((await send({ text: "/mute @mapmaker" })).text, /отключено/);
+  assert.match((await send({ ...author, text: "/add" }, 121)).text, /отключено/);
+  assert.match((await send({ text: "/moderation" })).text, /@mapmaker \(121\)/);
+  assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM locations").get().n, 1);
+  await send({ text: "/next" });
+  await Promise.all(tasks.splice(0));
+  assert.match(sent.find(({ method }) => method === "sendPhoto").caption, /Сложность: 5\/5\nОт <a href="tg:\/\/user\?id=121">&lt;Ира&gt;<\/a>/);
+  assert.match((await send({ ...author, text: "/start round_v2_1" }, 121)).text, /авторский результат уже учтён/);
+  await send({ text: "/start round_v2_1" });
+  await send({ from: { id: 42, first_name: "Макс", username: "wayoki" }, location: { latitude: 55.7, longitude: 37.6 } });
+  await Promise.all(tasks.splice(0));
+  await send({ text: "/close 1" });
+  await Promise.all(tasks.splice(0));
+  const reveal = sent.find(({ text }) => text?.startsWith("Раунд #1 завершён"));
+  assert.match(reveal.text, /ITMOGUESSR\*<\/a> — 5000/);
+  assert.match(reveal.text, /&lt;Ира&gt;<\/a> — 4321/);
+  assert.doesNotMatch(reveal.text, /Макс|wayoki/);
+  const buttons = reveal.reply_markup.inline_keyboard[0];
+  assert.deepEqual(buttons.map(({ text }) => text), ["❤️", "💔"]);
+  const messageId = sql.prepare("SELECT message_id FROM outbox WHERE kind='reveal'").get().message_id;
+  const vote = async (update_id, data, message_id = messageId) => {
+    const response = await worker.fetch(new Request("https://bot.example/telegram", {
+      method: "POST", headers: { "X-Telegram-Bot-Api-Secret-Token": "secret" },
+      body: JSON.stringify({ update_id, callback_query: { id: String(update_id), from: { id: 42 }, data, message: { message_id } } }),
+    }), env, { waitUntil() {} });
+    return response.json();
+  };
+  assert.match((await vote(101, buttons[0].callback_data, 999)).text, /нельзя/);
+  assert.equal((await vote(102, buttons[0].callback_data)).method, "answerCallbackQuery");
+  await vote(104, buttons[1].callback_data);
+  await vote(103, buttons[0].callback_data);
+  const stored = sql.prepare("SELECT round,user,vote FROM panorama_votes").all();
+  assert.equal(stored.length, 1);
+  assert.deepEqual({ ...stored[0] }, { round: 1, user: 42, vote: -1 });
+  await send({ text: "/unmute 121" });
+  assert.match((await send({ ...author, text: "/add" }, 121)).text, /включён/);
   sql.close();
 });

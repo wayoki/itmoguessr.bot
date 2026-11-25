@@ -48,15 +48,19 @@ function googlePlatform() {
         headers: { Authorization: 'Bearer ' + cachedToken },
       }), Failure, 'Google Drive');
     },
-    upload: (env, location, round, source, Failure) => {
+    mapsRedirect: url => {
+      const response = request(url, { followRedirects: false });
+      const status = response.getResponseCode();
+      if (status < 300 || status >= 400) return null;
+      const headers = response.getHeaders();
+      return headers.Location || headers.location || null;
+    },
+    upload: (env, location, round, source, Failure, post) => {
       const field = location.format[1];
       const blob = source.blob;
       if (!blob || blob.getBytes().length > 30000000) throw new Error('Prepared media is missing or exceeds the Google upload limit');
       blob.setName('round-' + round.id + '.' + location.format[2]);
-      const payload = {
-        chat_id: round.chat, caption: 'Раунд #' + round.id + ' (до ' + Utilities.formatDate(new Date(round.ends * 1000), 'Europe/Moscow', 'dd.MM, H:mm') + ' МСК)',
-        reply_markup: JSON.stringify({ inline_keyboard: [[{ text: 'Guess!', url: 'https://t.me/itmoguessr_bot?start=round_v2_' + round.id }]] }),
-      };
+      const payload = { ...post, reply_markup: JSON.stringify(post.reply_markup) };
       payload[field] = blob;
       if (field === 'video') payload.supports_streaming = 'true';
       return send(env, location.format[0], payload, Failure);

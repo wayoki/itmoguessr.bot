@@ -16,3 +16,7 @@ Apps Script has execution/runtime, URL Fetch and Drive quotas. The database is l
 `google/migration.gs` is a temporary, authenticated migration helper. It is not included in the regular build. Its expiring access key must be supplied only in the private Apps Script project, never committed, and the helper must be removed after verified cutover. It imports tables with triggers suspended and rollback on failure, preserves Telegram file IDs, and refuses to overwrite an active destination. The normal webhook returns a direct HTML acknowledgement to Telegram and allows retrying an interrupted update.
 
 Immutable SQL/code modules are cached in the script cache with SHA-256 validation; partial/evicted entries fall back to private Drive. The mutable database is never cached. GitHub Actions runs CI only; no maintenance secret is copied to the executor or transmitted by an Actions schedule.
+
+## Community panorama upgrade
+
+Build the Google assets from the reviewed source and publish them to the repository's existing `google/dist` path. The owner-run `releaseCommunityPanoramas_` in `google/release.gs` checks the pinned core manifest, validates the migration against the current Drive snapshot, and preserves the bot's Apps Script URL. It enables Telegram callback queries on the existing webhook, updates the private core binding under the script lock, then opens and verifies the new runtime. Prior code assets remain available. Only aggregate row counts are logged.

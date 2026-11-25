@@ -107,7 +107,12 @@ function googleRuntime_() {
     if (text.length > 8000000) throw new Error('Database exceeds the reviewed Google runtime size limit');
     driveWrite_(env.DATA_FILE_ID, text);
   };
-  env.DB = new core.GoogleDatabase(sqlite, persist);
+  try {
+    env.DB = new core.GoogleDatabase(sqlite, persist);
+  } catch (error) {
+    sqlite.close();
+    throw error;
+  }
   env.MEDIA = { get: () => { throw new Error('Upload videos directly to the bot with /add'); } };
   if (!env.DRIVE_SERVICE_ACCOUNT) env.DRIVE_SERVICE_ACCOUNT = '';
   return { env, core, sqlite, persist };
@@ -122,7 +127,7 @@ function withGoogleRuntime_(action) {
 function verifyGoogleBot() {
   return withGoogleRuntime_(runtime => {
     const count = name => runtime.env.DB.prepare('SELECT COUNT(*) AS n FROM ' + name).first('n');
-    console.log(JSON.stringify({ ready: true, active: runtime.env.GOOGLE_BOT_ACTIVE === 'true', rounds: count('rounds'), guesses: count('guesses'), locations: count('locations') }));
+    console.log(JSON.stringify({ ready: true, active: runtime.env.GOOGLE_BOT_ACTIVE === 'true', rounds: count('rounds'), guesses: count('guesses'), locations: count('locations'), panoramaVotes: count('panorama_votes'), sourceCommit: runtime.env.SOURCE_COMMIT }));
   });
 }
 function scheduledCheck() {

@@ -1,5 +1,10 @@
 export class GoogleDatabase {
-  constructor(sqlite, persist = () => {}) { this.sqlite = sqlite; this.persist = persist; this.batching = false; }
+  constructor(sqlite, persist = () => {}) {
+    this.sqlite = sqlite;
+    this.persist = persist;
+    this.batching = false;
+    if (migrateCommunityPanoramas(sqlite)) persist(sqlite.export());
+  }
   prepare(sql) {
     const database = this;
     const execute = (params, mode, column) => {

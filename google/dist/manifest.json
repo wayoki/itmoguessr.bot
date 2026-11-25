@@ -6,14 +6,14 @@
     "gzip": true
   },
   "core.js": {
-    "sha256": "0805322ebc7546bdb91a65c1312131f26d1522ddca86f3f4cdb2ee1eae3cf90b",
-    "bytes": 69640,
+    "sha256": "f6716a468622dd7a1814dc4aea4bcdd23314430c8c305bf11f79072a0ff9741f",
+    "bytes": 82002,
     "download": "core.js",
     "gzip": false
   },
   "schema.sql": {
-    "sha256": "5685a8cded28fa6584219945b8bae523f8f18ca101b3e99d62f1cc61b28e4e43",
-    "bytes": 8299,
+    "sha256": "e54f8091f76561e92f5ad1fc811fc35593f71f318f338f4779d3712f7e455c76",
+    "bytes": 10473,
     "download": "schema.sql",
     "gzip": false
   }

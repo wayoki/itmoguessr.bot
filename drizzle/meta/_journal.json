@@ -57,6 +57,13 @@
       "when": 1793923207000,
       "tag": "0007_telegram_locations",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1793923208000,
+      "tag": "0008_community_panoramas",
+      "breakpoints": true
     }
   ]
 }

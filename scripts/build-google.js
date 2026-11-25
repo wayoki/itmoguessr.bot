@@ -12,15 +12,36 @@ export async function buildGoogle() {
   const db = synchronous(await readFile('google/database.js', 'utf8'));
   const additions = synchronous(await readFile('locations-add.js', 'utf8'), { core: true });
   const core = synchronous(await readFile('index.js', 'utf8'), {
-    core: true, removeFunctions: ['driveToken', 'driveFetch', 'telegram', 'upload'],
+    core: true, removeFunctions: ['driveToken', 'driveFetch', 'telegram', 'upload', 'mapsRedirect'],
   });
+  const communityMigration = await readFile('drizzle/0008_community_panoramas.sql', 'utf8');
   const bridges = `
+    function migrateCommunityPanoramas(sqlite) {
+      if (sqlite.exec("SELECT 1 FROM settings WHERE key='schema:community_panoramas'").length) return false;
+      sqlite.run('BEGIN');
+      try {
+        sqlite.run(${JSON.stringify(communityMigration)});
+        sqlite.run('COMMIT');
+      } catch (error) {
+        sqlite.run('ROLLBACK');
+        throw error;
+      }
+      return true;
+    }
+    function mapsRedirect(url) {
+      if (platform.mapsRedirect) return platform.mapsRedirect(url);
+      const response = UrlFetchApp.fetch(url, { followRedirects: false, muteHttpExceptions: true });
+      const status = response.getResponseCode();
+      if (status < 300 || status >= 400) return null;
+      const headers = response.getHeaders();
+      return headers.Location || headers.location || null;
+    }
     function driveToken(env) { return platform.driveToken(env, ApiFailure); }
     function driveFetch(env, path, params, timeout) { return platform.driveFetch(env, path, params, timeout, ApiFailure); }
     function telegram(env, method, body, contentType) { return platform.telegram(env, method, body, contentType, ApiFailure); }
-    function upload(env, location, round, source) { return platform.upload(env, location, round, source, ApiFailure); }
+    function upload(env, location, round, source) { return platform.upload(env, location, round, source, ApiFailure, roundPost(round)); }
   `;
-  const names = ['coordinates','filenameLocation','filenameCoordinates','score','activeSlots','remainingWeekSlots','weekCoverage','weekCoverageText','weeklyWindow','monthlyWindow','leaderboard','weeklySummary','monthlySummary','publish','tick','webhook','inventory','scanLocations','mediaMetadata','driveToken','resetTestRounds','GoogleDatabase'];
+  const names = ['coordinates','filenameLocation','filenameCoordinates','score','activeSlots','remainingWeekSlots','weekCoverage','weekCoverageText','weeklyWindow','monthlyWindow','leaderboard','weeklySummary','monthlySummary','publish','tick','webhook','inventory','scanLocations','mediaMetadata','driveToken','resetTestRounds','GoogleDatabase','migrateCommunityPanoramas'];
   const bundle = `function createGoogleCore(platform) {\n${sync}\nconst gasAll = Immediate.all;\nconst TextEncoder = Utf8Encoder; const TextDecoder = Utf8Decoder;\nconst Response = platform.Response; const crypto = { randomUUID: platform.uuid };\n${db}\n${bridges}\n${additions}\n${core}\nreturn { ${names.join(', ')} };\n}\n`;
   const migrations = [];
   for (const name of (await readdir('drizzle')).filter(x => x.endsWith('.sql')).sort()) migrations.push(await readFile('drizzle/' + name, 'utf8'));

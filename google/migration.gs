@@ -72,7 +72,7 @@ function migrateActivate_(url){
   p.setProperties({GOOGLE_WEBAPP_URL:url,GOOGLE_BOT_ACTIVE:'true'});
   try{
     withGoogleRuntime_(r=>r.env.DB.prepare("UPDATE settings SET value=? WHERE key='paused'").bind(env.MIGRATION_ORIGINAL_PAUSED||'0').run());
-    googlePlatform().telegram(env,'setWebhook',{url:url+'?key='+encodeURIComponent(env.WEBHOOK_SECRET),secret_token:env.WEBHOOK_SECRET,max_connections:1,drop_pending_updates:false,allowed_updates:['message']},'application/json',Error);
+    googlePlatform().telegram(env,'setWebhook',{url:url+'?key='+encodeURIComponent(env.WEBHOOK_SECRET),secret_token:env.WEBHOOK_SECRET,max_connections:1,drop_pending_updates:false,allowed_updates:['message','callback_query']},'application/json',Error);
     if(!ScriptApp.getProjectTriggers().some(x=>x.getHandlerFunction()==='scheduledCheck'))ScriptApp.newTrigger('scheduledCheck').timeBased().everyMinutes(1).create();
     return migrateStatus_();
   }catch(error){p.setProperty('GOOGLE_BOT_ACTIVE','false');throw error;}

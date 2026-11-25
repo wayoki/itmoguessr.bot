@@ -100,6 +100,7 @@ class GoogleDatabase {
     this.sqlite = sqlite;
     this.persist = persist;
     this.batching = false;
+    if (migrateCommunityPanoramas(sqlite)) persist(sqlite.export());
   }
   prepare(sql) {
     const database = this;
@@ -153,109 +154,146 @@ class GoogleDatabase {
   }
 }
 
+    function migrateCommunityPanoramas(sqlite) {
+      if (sqlite.exec("SELECT 1 FROM settings WHERE key='schema:community_panoramas'").length) return false;
+      sqlite.run('BEGIN');
+      try {
+        sqlite.run("ALTER TABLE locations ADD COLUMN media_type TEXT NOT NULL DEFAULT 'video' CHECK(media_type IN ('video','photo'));\n--> statement-breakpoint\nALTER TABLE locations ADD COLUMN difficulty INTEGER CHECK(difficulty BETWEEN 1 AND 5);\n--> statement-breakpoint\nALTER TABLE locations ADD COLUMN author_name TEXT;\n--> statement-breakpoint\nALTER TABLE rounds ADD COLUMN author_user INTEGER;\n--> statement-breakpoint\nALTER TABLE rounds ADD COLUMN author_name TEXT;\n--> statement-breakpoint\nALTER TABLE rounds ADD COLUMN difficulty INTEGER CHECK(difficulty BETWEEN 1 AND 5);\n--> statement-breakpoint\nALTER TABLE location_upload_sessions RENAME TO legacy_location_upload_sessions;\n--> statement-breakpoint\nCREATE TABLE location_upload_sessions (\n  user INTEGER PRIMARY KEY, step TEXT NOT NULL CHECK(step IN ('off','video','coordinates','difficulty','points')),\n  last_message INTEGER NOT NULL, file_id TEXT, file_unique_id TEXT,\n  latitude REAL, longitude REAL, media_type TEXT NOT NULL DEFAULT 'video' CHECK(media_type IN ('video','photo')),\n  difficulty INTEGER CHECK(difficulty BETWEEN 1 AND 5)\n);\n--> statement-breakpoint\nINSERT INTO location_upload_sessions(user,step,last_message,file_id,file_unique_id,latitude,longitude)\n  SELECT user,step,last_message,file_id,file_unique_id,latitude,longitude FROM legacy_location_upload_sessions;\n--> statement-breakpoint\nDROP TABLE legacy_location_upload_sessions;\n--> statement-breakpoint\nUPDATE rounds SET author_user=(SELECT owner FROM locations WHERE 'telegram:' || file_unique_id=rounds.folder)\n  WHERE folder LIKE 'telegram:%';\n--> statement-breakpoint\nCREATE TABLE panorama_authors (\n  user INTEGER PRIMARY KEY, username TEXT UNIQUE\n);\n--> statement-breakpoint\nCREATE TABLE panorama_mutes (\n  user INTEGER PRIMARY KEY, admin INTEGER NOT NULL, muted_at INTEGER NOT NULL\n);\n--> statement-breakpoint\nCREATE TABLE panorama_votes (\n  round INTEGER NOT NULL REFERENCES rounds(id) ON DELETE CASCADE,\n  user INTEGER NOT NULL, vote INTEGER NOT NULL CHECK(vote IN (-1,1)),\n  updated INTEGER NOT NULL, update_id INTEGER NOT NULL,\n  PRIMARY KEY(round,user)\n);\n--> statement-breakpoint\nINSERT INTO settings VALUES ('schema:community_panoramas','1');\n");
+        sqlite.run('COMMIT');
+      } catch (error) {
+        sqlite.run('ROLLBACK');
+        throw error;
+      }
+      return true;
+    }
+    function mapsRedirect(url) {
+      if (platform.mapsRedirect) return platform.mapsRedirect(url);
+      const response = UrlFetchApp.fetch(url, { followRedirects: false, muteHttpExceptions: true });
+      const status = response.getResponseCode();
+      if (status < 300 || status >= 400) return null;
+      const headers = response.getHeaders();
+      return headers.Location || headers.location || null;
+    }
     function driveToken(env) { return platform.driveToken(env, ApiFailure); }
     function driveFetch(env, path, params, timeout) { return platform.driveFetch(env, path, params, timeout, ApiFailure); }
     function telegram(env, method, body, contentType) { return platform.telegram(env, method, body, contentType, ApiFailure); }
-    function upload(env, location, round, source) { return platform.upload(env, location, round, source, ApiFailure); }
+    function upload(env, location, round, source) { return platform.upload(env, location, round, source, ApiFailure, roundPost(round)); }
   
 const query = (env, sql, ...args) => env.DB.prepare(sql).bind(...args);
 const uploadOwner = env => String(env.LOCATION_OWNER_ID || String(env.ADMIN_IDS || "").split(/[,\s]+/).find(Boolean) || "");
-const promptVideo = "Пришли следующее видео. Выход — /done, отменить текущую локацию — /cancel.";
-const promptPoint = "Теперь пришли координаты: широта, долгота (например, 55.7558, 37.6173) или обычную геопозицию. /cancel — отменить.";
+const isPanoramaAdmin = (env, user) => String(user) === uploadOwner(env) || String(env.ADMIN_IDS || "").split(/[,\s]+/).includes(String(user));
+const promptMedia = "Пришли одно фото или видео. Выход — /done, отменить текущую локацию — /cancel.";
+const promptPoint = "Пришли ссылку на метку Google Maps, координаты (например, 55.7558, 37.6173) или обычную геопозицию. /cancel — отменить.";
+const promptDifficulty = "Укажи сложность числом от 1 до 5. 1 — легко, 5 — очень сложно. /cancel — отменить.";
 const promptScore = "Сколько очков ты набрал? Пришли целое число от 0 до 5000. /cancel — отменить.";
 const prompts = {
-  video: promptVideo,
+  video: promptMedia,
   coordinates: promptPoint,
+  difficulty: promptDifficulty,
   points: promptScore
 };
-function addLocation(env, message, command, coordinates, coverage) {
+const clearDraft = "file_id=NULL,file_unique_id=NULL,latitude=NULL,longitude=NULL,media_type='video',difficulty=NULL";
+function addLocation(env, message, command, locationPoint, coverage) {
   const user = message.from.id;
   const control = ["/add", "/done", "/cancel"].includes(command);
-  if (String(user) !== uploadOwner(env)) return control ? "Добавление локаций доступно только владельцу бота." : null;
   const session = unwrap(query(env, "SELECT * FROM location_upload_sessions WHERE user=?", user).first());
   if (!control && (!session || session.step === "off")) return null;
   const id = message.message_id;
-  if (!Number.isSafeInteger(id) || session && id <= session.last_message) return control || session && session.step !== "off" ? "Это сообщение уже обработано." : null;
-  if (command === "/add") {
-    if (session && session.step !== "off") return prompts[session.step];
-    unwrap(query(env, `INSERT INTO location_upload_sessions(user,step,last_message) VALUES(?,'video',?)
-      ON CONFLICT(user) DO UPDATE SET step='video',last_message=excluded.last_message,
-      file_id=NULL,file_unique_id=NULL,latitude=NULL,longitude=NULL WHERE last_message<excluded.last_message`, user, id).run());
-    return "Режим добавления включён. Пришли одно видео как видео в Telegram, затем я спрошу координаты и твой счёт. Выход — /done.";
-  }
+  if (!Number.isSafeInteger(id) || session && id <= session.last_message) return "Это сообщение уже обработано.";
   if (command === "/done" || command === "/cancel") {
     if (!session || session.step === "off") return "Режим добавления выключен. Начать — /add.";
-    unwrap(query(env, `UPDATE location_upload_sessions SET step=?,last_message=?,file_id=NULL,file_unique_id=NULL,
-      latitude=NULL,longitude=NULL WHERE user=? AND last_message<?`, command === "/done" ? "off" : "video", id, user, id).run());
-    return command === "/done" ? "Вышел из режима добавления. Готовые локации сохранены, незавершённая отменена." : "Текущая локация отменена. " + promptVideo;
+    unwrap(query(env, `UPDATE location_upload_sessions SET step=?,last_message=?,${clearDraft}
+      WHERE user=? AND last_message<?`, command === "/done" ? "off" : "video", id, user, id).run());
+    return command === "/done" ? "Режим добавления выключен. Готовые локации сохранены." : "Текущая локация отменена. " + promptMedia;
   }
-  if (!session || session.step === "off") return null;
+  if (unwrap(query(env, "SELECT 1 FROM panorama_mutes WHERE user=?", user).first())) {
+    return "Добавление панорам для тебя отключено.";
+  }
+  if (command === "/add") {
+    const username = /^[a-z0-9_]{1,32}$/i.test(message.from.username || "") ? message.from.username.toLowerCase() : null;
+    unwrap(env.DB.batch([query(env, "UPDATE panorama_authors SET username=NULL WHERE username=? AND user<>?", username, user), query(env, `INSERT INTO panorama_authors VALUES(?,?)
+        ON CONFLICT(user) DO UPDATE SET username=excluded.username`, user, username)]));
+    if (session && session.step !== "off") return prompts[session.step];
+    unwrap(query(env, `INSERT INTO location_upload_sessions(user,step,last_message)
+      SELECT ?,'video',? WHERE NOT EXISTS(SELECT 1 FROM panorama_mutes WHERE user=?)
+      ON CONFLICT(user) DO UPDATE SET step='video',last_message=excluded.last_message,${clearDraft}
+      WHERE last_message<excluded.last_message`, user, id, user).run());
+    return "Режим добавления включён. " + promptMedia;
+  }
   if (command) return "Сейчас включено добавление локаций. " + prompts[session.step];
-  if (message.media_group_id) return "Отправляй видео по одному, без альбома. " + prompts[session.step];
+  if (message.media_group_id) return "Отправляй фото и видео по одному, без альбома. " + prompts[session.step];
   if (session.step === "video") {
-    const video = message.video;
-    if (!video?.file_id || !video.file_unique_id) return "Пришли ролик как видео, а не как файл. " + promptVideo;
-    if (unwrap(query(env, "SELECT 1 FROM locations WHERE file_unique_id=?", video.file_unique_id).first())) return "Это видео уже есть в locations. " + promptVideo;
-    unwrap(query(env, `UPDATE location_upload_sessions SET step='coordinates',last_message=?,file_id=?,file_unique_id=?
-      WHERE user=? AND step='video' AND last_message=?`, id, video.file_id, video.file_unique_id, user, session.last_message).run());
+    const media = message.video || message.photo?.at(-1);
+    if (!media?.file_id || !media.file_unique_id) return "Пришли панораму как видео или фото в Telegram. " + promptMedia;
+    if (unwrap(query(env, "SELECT 1 FROM locations WHERE file_unique_id=?", media.file_unique_id).first())) {
+      return "Эта панорама уже есть в очереди или была сыграна. " + promptMedia;
+    }
+    unwrap(query(env, `UPDATE location_upload_sessions SET step='coordinates',last_message=?,file_id=?,file_unique_id=?,media_type=?
+      WHERE user=? AND step='video' AND last_message=?`, id, media.file_id, media.file_unique_id, message.video ? "video" : "photo", user, session.last_message).run());
     return promptPoint;
   }
   if (session.step === "coordinates") {
-    const geo = message.location;
-    const point = geo ? !geo.live_period && Number.isFinite(geo.latitude) && Number.isFinite(geo.longitude) && Math.abs(geo.latitude) <= 90 && Math.abs(geo.longitude) <= 180 ? [geo.latitude, geo.longitude] : null : coordinates(message.text);
+    const point = unwrap(locationPoint(message));
     if (!point) return "Не распознал координаты. " + promptPoint;
-    unwrap(query(env, `UPDATE location_upload_sessions SET step='points',last_message=?,latitude=?,longitude=?
+    unwrap(query(env, `UPDATE location_upload_sessions SET step='difficulty',last_message=?,latitude=?,longitude=?
       WHERE user=? AND step='coordinates' AND last_message=?`, id, ...point, user, session.last_message).run());
-    return promptScore;
+    return promptDifficulty;
   }
   const text = String(message.text || "").trim();
+  if (session.step === "difficulty") {
+    if (!/^[1-5]$/.test(text)) return promptDifficulty;
+    unwrap(query(env, `UPDATE location_upload_sessions SET step='points',last_message=?,difficulty=?
+      WHERE user=? AND step='difficulty' AND last_message=?`, id, Number(text), user, session.last_message).run());
+    return promptScore;
+  }
   if (!/^\d{1,4}$/.test(text) || Number(text) > 5000) return "Нужно целое число от 0 до 5000. " + promptScore;
-  unwrap(env.DB.batch([query(env, `INSERT INTO locations(file_unique_id,file_id,latitude,longitude,author_points,owner,created)
-      SELECT file_unique_id,file_id,latitude,longitude,?,user,? FROM location_upload_sessions
-      WHERE user=? AND step='points' AND last_message=? ON CONFLICT(file_unique_id) DO NOTHING`, Number(text), Math.floor(Date.now() / 1000), user, session.last_message), query(env, `UPDATE location_upload_sessions SET step='video',last_message=?,file_id=NULL,file_unique_id=NULL,
-      latitude=NULL,longitude=NULL WHERE user=? AND step='points' AND last_message=?`, id, user, session.last_message)]));
+  const name = [message.from.first_name, message.from.last_name].filter(Boolean).join(" ").trim() || (message.from.username ? "@" + message.from.username : "Игрок");
+  const [saved] = unwrap(env.DB.batch([query(env, `INSERT INTO locations(file_unique_id,file_id,latitude,longitude,author_points,owner,created,media_type,difficulty,author_name)
+      SELECT file_unique_id,file_id,latitude,longitude,?,user,?,media_type,difficulty,? FROM location_upload_sessions
+      WHERE user=? AND step='points' AND last_message=? AND NOT EXISTS(SELECT 1 FROM panorama_mutes WHERE user=?)
+      ON CONFLICT(file_unique_id) DO NOTHING`, Number(text), Math.floor(Date.now() / 1000), isPanoramaAdmin(env, user) ? null : name.slice(0, 80), user, session.last_message, user), query(env, `UPDATE location_upload_sessions SET step='video',last_message=?,${clearDraft}
+      WHERE user=? AND step='points' AND last_message=?`, id, user, session.last_message)]));
+  if (!(saved.meta?.changes ?? saved.changes)) return "Эта панорама уже сохранена или добавление отключено. " + promptMedia;
   let weekly = "";
-  if (coverage) {
+  if (coverage && isPanoramaAdmin(env, user)) {
     try {
       weekly = "\n\n" + unwrap(coverage(env));
     } catch {
-      weekly = "\n\nОстаток до вечера воскресенья сейчас не удалось посчитать. Видео сохранено.";
+      weekly = "\n\nОстаток до вечера воскресенья сейчас не удалось посчитать. Панорама сохранена.";
     }
   }
-  return `Сохранено в locations: ${session.latitude}, ${session.longitude}. Твой результат: ${Number(text)} / 5000.${weekly}\n\n${promptVideo}`;
+  return `Сохранено: ${session.latitude}, ${session.longitude}. Твой результат: ${Number(text)} / 5000.${weekly}\n\n${promptMedia}`;
 }
+const availableLocation = `NOT EXISTS(
+    SELECT 1 FROM rounds r WHERE r.status<>'failed' AND (r.folder='telegram:' || l.file_unique_id
+      OR (r.latitude=l.latitude AND r.longitude=l.longitude)))
+  AND NOT EXISTS(SELECT 1 FROM retired_locations r WHERE r.folder='telegram:' || l.file_unique_id)`;
 function telegramLocation(env, failedFolder) {
-  const row = unwrap(query(env, `SELECT l.* FROM locations l
-    WHERE ('telegram:' || l.file_unique_id)<>? AND NOT EXISTS(
-      SELECT 1 FROM rounds r WHERE r.status<>'failed' AND (r.folder='telegram:' || l.file_unique_id
-        OR (r.latitude=l.latitude AND r.longitude=l.longitude)))
-    AND NOT EXISTS(SELECT 1 FROM retired_locations r WHERE r.folder='telegram:' || l.file_unique_id)
-    ORDER BY RANDOM() LIMIT 1`, failedFolder || "").first());
+  const row = unwrap(query(env, `SELECT l.* FROM locations l WHERE ('telegram:' || l.file_unique_id)<>?
+    AND ${availableLocation} ORDER BY RANDOM() LIMIT 1`, failedFolder || "").first());
   return row ? {
     folder: "telegram:" + row.file_unique_id,
     telegramFileId: row.file_id,
+    mediaType: row.media_type,
     point: [row.latitude, row.longitude],
-    authorPoints: row.author_points
+    authorPoints: row.author_points,
+    authorUser: row.owner,
+    authorName: row.author_name,
+    difficulty: row.difficulty
   } : null;
 }
 function telegramInventory(env) {
-  return query(env, `SELECT COUNT(*) AS n FROM locations l WHERE NOT EXISTS(
-    SELECT 1 FROM rounds r WHERE r.status<>'failed' AND (r.folder='telegram:' || l.file_unique_id
-      OR (r.latitude=l.latitude AND r.longitude=l.longitude)))
-    AND NOT EXISTS(SELECT 1 FROM retired_locations r WHERE r.folder='telegram:' || l.file_unique_id)`).first("n");
+  return query(env, `SELECT COUNT(*) AS n FROM locations l WHERE ${availableLocation}`).first("n");
 }
 function telegramQueuePoints(env) {
-  const rows = unwrap(query(env, `SELECT DISTINCT latitude,longitude FROM locations l WHERE NOT EXISTS(
-    SELECT 1 FROM rounds r WHERE r.status<>'failed' AND (r.folder='telegram:' || l.file_unique_id
-      OR (r.latitude=l.latitude AND r.longitude=l.longitude)))
-    AND NOT EXISTS(SELECT 1 FROM retired_locations r WHERE r.folder='telegram:' || l.file_unique_id)`).all());
+  const rows = unwrap(query(env, `SELECT DISTINCT latitude,longitude FROM locations l WHERE ${availableLocation}`).all());
   return new Set(rows.results.map(row => `${row.latitude},${row.longitude}`));
 }
 const game = {
   bot: "itmoguessr_bot",
-  author: {
-    name: "макс.",
-    username: "wayoki"
+  club: {
+    name: "ITMOGUESSR*",
+    profile: "https://t.me/itmoguessr"
   },
   chat: "@swidfkjew",
   drive: "1rlP26NNEgdsHkv1n1QGo9SAkaT6aCady",
@@ -336,6 +374,62 @@ function coordinates(name) {
   if (!match) return null;
   const point = match.slice(1).map(Number);
   return Math.abs(point[0]) <= 90 && Math.abs(point[1]) <= 180 ? point : null;
+}
+function mapsLink(text) {
+  const match = /^(https:\/\/(?:www\.google\.[a-z.]+|maps\.google\.[a-z.]+|maps\.app\.goo\.gl|goo\.gl))([^\s#]*)$/i.exec(text);
+  if (!match) return null;
+  const host = match[1].toLowerCase();
+  const path = match[2];
+  if (host === "https://maps.app.goo.gl" || host === "https://goo.gl") {
+    return /^\/(?:maps\/)?[A-Za-z0-9_-]+(?:\?[^\s]*)?$/.test(path) ? {
+      short: true,
+      path
+    } : null;
+  }
+  if (!/^https:\/\/(?:www|maps)\.google\.(?:com|ru|de|co\.uk|com\.ua|com\.tr|fr|it|es|nl|pl|ca|com\.au)$/.test(host)) return null;
+  if (host.startsWith("https://www.") && !/^\/maps(?:\/|\?|$)/.test(path)) return null;
+  return {
+    path
+  };
+}
+function mapsCoordinates(text) {
+  const link = mapsLink(text);
+  if (!link || link.short) return null;
+  let path;
+  try {
+    path = decodeURIComponent(link.path).replace(/\+/g, " ");
+  } catch {
+    return null;
+  }
+  for (const value of path.matchAll(/[?&](?:query|q|ll|cbll|viewpoint)=([^&]+)/gi)) {
+    const match = /^\s*([\d. -]+,\s*[\d.-]+)(?:\s*\([^)]*\))?\s*$/.exec(value[1]);
+    const point = match && coordinates(match[1].trim());
+    if (point) return point;
+  }
+  for (const pattern of [/!3d(-?[\d.]+)!4d(-?[\d.]+)/g, /!1d(-?[\d.]+)!2d(-?[\d.]+)/g, /@(-?[\d.]+),(-?[\d.]+)(?=[,/?]|$)/g]) {
+    for (const match of path.matchAll(pattern)) {
+      const point = coordinates(match[1] + "," + match[2]);
+      if (point) return point;
+    }
+  }
+  return null;
+}
+function locationPoint(message) {
+  const geo = message.location;
+  if (geo) {
+    return !geo.live_period && Number.isFinite(geo.latitude) && Number.isFinite(geo.longitude) && Math.abs(geo.latitude) <= 90 && Math.abs(geo.longitude) <= 180 ? [geo.latitude, geo.longitude] : null;
+  }
+  let text = String(message.text || "").trim();
+  try {
+    for (let hop = 0; hop <= 3; hop++) {
+      const point = coordinates(text) || mapsCoordinates(text);
+      if (point) return point;
+      if (hop === 3 || !mapsLink(text)?.short) break;
+      text = unwrap(mapsRedirect(text));
+      if (!text) break;
+    }
+  } catch {}
+  return null;
 }
 function filenameLocation(name) {
   const stem = String(name ?? "").replace(/\.(mp4|mov|webm|mkv|jpe?g|png|gif)$/i, "").replace(/__telegram$/i, "").trim();
@@ -696,19 +790,10 @@ function chooseLocation(env, failedFolder) {
 function multipart(location, round) {
   const [, field, extension] = location.format;
   const boundary = `itmoguessr-${crypto.randomUUID()}`;
-  const deadline = timeLabel.formatToParts(round.ends * 1000).map(({
-    type,
-    value
-  }) => type === "hour" ? String(Number(value)) : value).join("");
+  const post = roundPost(round);
   const fields = {
-    chat_id: round.chat,
-    caption: `Раунд #${round.id} (до ${deadline} МСК)`,
-    reply_markup: JSON.stringify({
-      inline_keyboard: [[{
-        text: "Guess!",
-        url: `https://t.me/${game.bot}?start=${roundLinkPrefix}${round.id}`
-      }]]
-    })
+    ...post,
+    reply_markup: JSON.stringify(post.reply_markup)
   };
   if (field === "video") {
     fields.supports_streaming = "true";
@@ -744,31 +829,35 @@ function publish(env, slot, end) {
     supportsAllDrives: "true"
   }));
   if (!location.telegramFileId && !source?.body) throw new Error("Media body is unavailable");
+  const authorship = [location.authorUser ?? null, location.authorName ?? null, location.difficulty ?? null];
   let round;
   try {
     const now = clock();
     if (now >= end) return null;
-    round = unwrap(db(env, `INSERT INTO rounds(slot,folder,latitude,longitude,author_points,chat,ends,status,updated)
-      VALUES(?,?,?,?,?,?,?,'publishing',?) ON CONFLICT DO NOTHING RETURNING *`, slot, location.folder, ...location.point, location.authorPoints, chat(env), end, now).first());
+    round = unwrap(db(env, `INSERT INTO rounds(slot,folder,latitude,longitude,author_points,author_user,author_name,difficulty,chat,ends,status,updated)
+      VALUES(?,?,?,?,?,?,?,?,?,?,'publishing',?) ON CONFLICT DO NOTHING RETURNING *`, slot, location.folder, ...location.point, location.authorPoints, ...authorship, chat(env), end, now).first());
     if (!round && saved?.status === "failed") {
-      round = unwrap(db(env, `UPDATE rounds SET folder=?,latitude=?,longitude=?,author_points=?,chat=?,ends=?,status='publishing',updated=?
-        WHERE slot=? AND status='failed' AND NOT EXISTS(SELECT 1 FROM rounds WHERE folder=? AND status<>'failed') RETURNING *`, location.folder, ...location.point, location.authorPoints, chat(env), end, now, slot, location.folder).first());
+      round = unwrap(db(env, `UPDATE rounds SET folder=?,latitude=?,longitude=?,author_points=?,author_user=?,author_name=?,difficulty=?,chat=?,ends=?,status='publishing',updated=?
+        WHERE slot=? AND status='failed' AND NOT EXISTS(SELECT 1 FROM rounds WHERE folder=? AND status<>'failed') RETURNING *`, location.folder, ...location.point, location.authorPoints, ...authorship, chat(env), end, now, slot, location.folder).first());
     }
     if (!round) return null;
     let message;
     try {
-      message = location.telegramFileId ? unwrap(telegram(env, "sendVideo", {
-        chat_id: round.chat,
-        video: location.telegramFileId,
-        supports_streaming: true,
-        caption: `Раунд #${round.id} (до ${timeLabel.format(round.ends * 1000)} МСК)`,
-        reply_markup: {
-          inline_keyboard: [[{
-            text: "Guess!",
-            url: `https://t.me/${game.bot}?start=${roundLinkPrefix}${round.id}`
-          }]]
-        }
-      })) : unwrap(upload(env, location, round, source.body));
+      if (location.telegramFileId) {
+        const photo = location.mediaType === "photo";
+        const media = photo ? {
+          photo: location.telegramFileId
+        } : {
+          video: location.telegramFileId,
+          supports_streaming: true
+        };
+        message = unwrap(telegram(env, photo ? "sendPhoto" : "sendVideo", {
+          ...roundPost(round),
+          ...media
+        }));
+      } else {
+        message = unwrap(upload(env, location, round, source.body));
+      }
     } catch (error) {
       const rejected = error instanceof ApiFailure && error.status >= 400 && error.status < 500;
       unwrap(db(env, "UPDATE rounds SET status=?,updated=? WHERE id=?", rejected ? "failed" : "uncertain", clock(), round.id).run());
@@ -781,6 +870,26 @@ function publish(env, slot, end) {
   }
 }
 const validUsername = username => typeof username === "string" && /^[a-z0-9_]{1,32}$/i.test(username);
+const clubMention = () => `<a href="${game.club.profile}">${game.club.name}</a>`;
+function roundPost(round) {
+  const deadline = timeLabel.formatToParts(round.ends * 1000).map(({
+    type,
+    value
+  }) => type === "hour" ? String(Number(value)) : value).join("");
+  const author = round.author_name && Number.isSafeInteger(round.author_user) ? mention(round.author_user, round.author_name) : clubMention();
+  const caption = [`Раунд #${round.id} (до ${deadline} МСК)`, ...(round.difficulty == null ? [] : [`Сложность: ${round.difficulty}/5`]), `От ${author}`].join("\n");
+  return {
+    chat_id: round.chat,
+    caption,
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [[{
+        text: "Guess!",
+        url: `https://t.me/${game.bot}?start=${roundLinkPrefix}${round.id}`
+      }]]
+    }
+  };
+}
 const mention = (user, name, username) => {
   const hasUsername = validUsername(username);
   const label = name?.trim() || (hasUsername ? "@" + username : "Игрок");
@@ -788,15 +897,17 @@ const mention = (user, name, username) => {
   return `<a href="${profile}">${escapeHtml(label.slice(0, 80))}</a>`;
 };
 const googleMaps = (latitude, longitude) => `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${latitude},${longitude}`)}`;
-function leaderboard(round, players, authorId) {
+function leaderboard(round, players, ownerId) {
+  const authorUser = round.author_user ?? Number(ownerId);
   const author = round.author_points == null ? null : {
-    ...game.author,
-    user: authorId,
+    name: round.author_name,
+    user: authorUser,
+    club: !round.author_name,
     points: round.author_points,
     km: Infinity,
     submitted: Infinity
   };
-  const ranking = players.filter(player => !author || String(player.user) !== authorId && player.username?.toLowerCase() !== author.username).map(player => ({
+  const ranking = players.filter(player => !author || Number(player.user) !== authorUser).map(player => ({
     ...player,
     ...score(player.latitude, player.longitude, round.latitude, round.longitude)
   }));
@@ -804,7 +915,8 @@ function leaderboard(round, players, authorId) {
   ranking.sort((a, b) => b.points - a.points || a.km - b.km || a.submitted - b.submitted || a.user - b.user);
   const heading = round.corrected ? `🛠 Исправление раунда #${round.id}` : `Раунд #${round.id} завершён.`;
   const lines = ranking.slice(0, 10).map((player, index) => {
-    const line = `${index + 1}. ${mention(player.user, player.name, player.username)} — ${player.points}`;
+    const name = player.club || String(player.user) === ownerId ? clubMention() : mention(player.user, player.name, player.username);
+    const line = `${index + 1}. ${name} — ${player.points}`;
     return index === 0 ? `<b>${line}</b>` : line;
   });
   return lines.length ? [heading, "", ...lines].join("\n") : heading;
@@ -835,6 +947,7 @@ function playerStats(rows) {
         user: row.user,
         name: row.name,
         username: row.username,
+        club: row.club,
         rounds: 0,
         total: 0
       });
@@ -853,14 +966,18 @@ function reportSection(heading, players, detail, mentions, empty) {
     const {
       user,
       name,
-      username
+      username,
+      club
     } = player;
     mentions?.push({
       user,
       name,
-      username
+      username,
+      ...(club ? {
+        club: true
+      } : {})
     });
-    return `${index + 1}. ${mention(user, name, username)} ${detail(player)}`;
+    return `${index + 1}. ${club ? clubMention() : mention(user, name, username)} ${detail(player)}`;
   });
   return [`<b>${heading}:</b>`, ...(lines.length ? lines : [empty])].join("\n");
 }
@@ -929,11 +1046,21 @@ function monthlySummary(rows, mentions, start, end) {
   return sections.join("\n\n");
 }
 function reportGuesses(env, start, end) {
+  const ownerId = Number(uploadOwner(env)) || null;
   const {
     results
-  } = unwrap(db(env, `SELECT g.user,g.name,g.username,g.submitted,g.points,g.latitude,g.longitude,
-    r.latitude AS target_latitude,r.longitude AS target_longitude FROM guesses g JOIN rounds r ON r.id=g.round
-    WHERE g.submitted>=? AND g.submitted<? ORDER BY g.submitted DESC,g.round DESC`, start, end).all());
+  } = unwrap(db(env, `SELECT * FROM (SELECT g.user,g.name,g.username,g.submitted,g.points,g.latitude,g.longitude,
+    r.latitude AS target_latitude,r.longitude AS target_longitude,g.round,g.user=? AS club
+    FROM guesses g JOIN rounds r ON r.id=g.round WHERE g.submitted>=? AND g.submitted<?
+      AND (r.author_points IS NULL OR g.user IS NOT COALESCE(r.author_user,?))
+    UNION ALL
+    SELECT COALESCE(r.author_user,?),r.author_name,NULL,
+      COALESCE(CAST(strftime('%s',substr(r.slot,instr(r.slot,':')+1) || CASE
+        WHEN r.slot LIKE 'morning:%' THEN ' 07:00:00' WHEN r.slot LIKE 'evening:%' THEN ' 17:00:00' END) AS INTEGER),r.ends-1),
+      r.author_points,r.latitude,r.longitude,r.latitude,r.longitude,r.id,
+      r.author_name IS NULL OR r.author_user=?
+    FROM rounds r WHERE r.status='closed' AND r.author_points IS NOT NULL AND COALESCE(r.author_user,?) IS NOT NULL
+    ) WHERE submitted>=? AND submitted<? ORDER BY submitted DESC,round DESC`, ownerId, start, end, ownerId, ownerId, ownerId, ownerId, start, end).all());
   return results;
 }
 function prepareWeeklyReport(env, start, end, now) {
@@ -947,7 +1074,10 @@ function prepareWeeklyReport(env, start, end, now) {
 }
 function prepareMonthlyReport(env, start, end, now) {
   const [rows, reports] = unwrap(unwrap(gasAll([reportGuesses(env, start, end), db(env, "SELECT mentions FROM weekly_reports WHERE status='sent' AND updated>=? AND updated<? ORDER BY updated DESC", start, end).all()])));
-  const mentions = reports.results.flatMap(report => JSON.parse(report.mentions));
+  const mentions = reports.results.flatMap(report => JSON.parse(report.mentions)).map(entry => String(entry.user) === uploadOwner(env) ? {
+    ...entry,
+    club: true
+  } : entry);
   unwrap(db(env, "INSERT OR IGNORE INTO monthly_reports(month_start,text,status,updated) VALUES(?,?,'pending',?)", start, monthlySummary(rows, mentions, start, end), now).run());
 }
 function publishReport(env, now, window, table, key, prepare) {
@@ -986,7 +1116,7 @@ function publishReport(env, now, window, table, key, prepare) {
 }
 function inventory(env) {
   const direct = unwrap(telegramInventory(env));
-  if (!driveMediaEnabled(env)) return `Остаток видео для новых раундов\nГотовы: ${direct}\nИсточник: Telegram (locations).`;
+  if (!driveMediaEnabled(env)) return `Остаток панорам для новых раундов\nГотовы: ${direct}\nИсточник: Telegram.`;
   try {
     return `В Telegram готовы: ${direct}\n` + unwrap(driveInventory(env));
   } catch (error) {
@@ -1020,7 +1150,7 @@ function delivery(env, item) {
     };
   }
   if (item.kind === "result") return null;
-  const row = unwrap(db(env, `SELECT r.id,r.latitude,r.longitude,r.author_points,g.name,g.username,g.points,g.distance,
+  const row = unwrap(db(env, `SELECT r.id,r.latitude,r.longitude,r.author_points,r.author_user,r.author_name,g.name,g.username,g.points,g.distance,
     g.latitude AS guess_latitude,g.longitude AS guess_longitude,
     EXISTS(SELECT 1 FROM settings WHERE key='correction:' || r.id) AS corrected
     FROM rounds r LEFT JOIN guesses g ON g.round=r.id AND g.user=? WHERE r.id=?`, item.user, item.round).first());
@@ -1043,7 +1173,7 @@ function delivery(env, item) {
   }
   let text;
   if (item.kind === "guess") {
-    const name = mention(item.user, row.name, row.username);
+    const name = String(item.user) === uploadOwner(env) ? clubMention() : mention(item.user, row.name, row.username);
     if (!showGuessDetails(env, item.round)) {
       text = `${name} сделал guess в раунде #${item.round}`;
     } else {
@@ -1054,8 +1184,19 @@ function delivery(env, item) {
     }
   } else {
     const players = unwrap(db(env, "SELECT user,name,username,latitude,longitude,submitted FROM guesses WHERE round=?", item.round).all()).results;
-    text = leaderboard(row, players, firstAdmin(env));
+    text = leaderboard(row, players, uploadOwner(env)) + "\n\nОцените панораму";
   }
+  const rating = item.kind === "reveal" ? {
+    reply_markup: {
+      inline_keyboard: [[{
+        text: "❤️",
+        callback_data: `panorama_vote:${item.round}:1`
+      }, {
+        text: "💔",
+        callback_data: `panorama_vote:${item.round}:-1`
+      }]]
+    }
+  } : {};
   return {
     method: "sendMessage",
     body: {
@@ -1064,7 +1205,8 @@ function delivery(env, item) {
       parse_mode: "HTML",
       link_preview_options: {
         is_disabled: true
-      }
+      },
+      ...rating
     }
   };
 }
@@ -1133,14 +1275,40 @@ function verifyDrive(env) {
 function resetTestRounds(env) {
   const canReset = `EXISTS(SELECT 1 FROM settings WHERE key='paused' AND value='1')
     AND NOT EXISTS(SELECT 1 FROM settings WHERE key='club_launched')`;
-  unwrap(env.DB.batch([db(env, `INSERT OR IGNORE INTO retired_locations SELECT folder FROM rounds WHERE status<>'failed' AND ${canReset}`), db(env, `DELETE FROM outbox WHERE ${canReset}`), db(env, `DELETE FROM selected WHERE ${canReset}`), db(env, `DELETE FROM guesses WHERE ${canReset}`), db(env, `DELETE FROM rounds WHERE ${canReset}`), db(env, `DELETE FROM settings WHERE (key='drive_cursor_v2' OR key LIKE 'correction:%') AND ${canReset}`), db(env, `INSERT INTO settings SELECT 'club_launched','1' WHERE ${canReset}`)]));
+  unwrap(env.DB.batch([db(env, `INSERT OR IGNORE INTO retired_locations SELECT folder FROM rounds WHERE status<>'failed' AND ${canReset}`), db(env, `DELETE FROM outbox WHERE ${canReset}`), db(env, `DELETE FROM selected WHERE ${canReset}`), db(env, `DELETE FROM guesses WHERE ${canReset}`), db(env, `DELETE FROM panorama_votes WHERE ${canReset}`), db(env, `DELETE FROM rounds WHERE ${canReset}`), db(env, `DELETE FROM settings WHERE (key='drive_cursor_v2' OR key LIKE 'correction:%') AND ${canReset}`), db(env, `INSERT INTO settings SELECT 'club_launched','1' WHERE ${canReset}`)]));
   return Boolean(unwrap(db(env, "SELECT 1 FROM settings WHERE key='club_launched'").first()));
 }
 function admin(env, ctx, message, command, args, updateId) {
-  if (!String(env.ADMIN_IDS || "").split(/[,\s]+/).includes(String(message.from.id))) {
+  if (!isPanoramaAdmin(env, message.from.id)) {
     return reply(message, "Эта команда доступна администраторам.");
   }
   switch (command) {
+    case "/moderation":
+      {
+        const {
+          results
+        } = unwrap(db(env, `SELECT m.user,a.username FROM panorama_mutes m
+        LEFT JOIN panorama_authors a ON a.user=m.user ORDER BY m.muted_at DESC,m.user LIMIT 20`).all());
+        const list = results.map(({
+          user,
+          username
+        }) => username ? `@${username} (${user})` : String(user));
+        return reply(message, ["/mute ID или @username — отключить добавление.", "/unmute ID или @username — вернуть доступ.", list.length ? "Последние ограничения:\n" + list.join("\n") : "Активных ограничений нет."].join("\n"));
+      }
+    case "/mute":
+    case "/unmute":
+      {
+        const handle = /^@([a-z0-9_]{1,32})$/i.exec(args);
+        const target = validId(args) ? Number(args) : handle ? unwrap(db(env, "SELECT user FROM panorama_authors WHERE username=?", handle[1].toLowerCase()).first("user")) : null;
+        if (!target) return reply(message, `Используй ${command} Telegram_ID или ${command} @username. Ник можно найти после /add.`);
+        if (isPanoramaAdmin(env, target)) return reply(message, "Эта команда действует на участников клуба.");
+        if (command === "/unmute") {
+          unwrap(db(env, "DELETE FROM panorama_mutes WHERE user=?", target).run());
+          return reply(message, `Добавление панорам для ${target} снова доступно.`);
+        }
+        unwrap(env.DB.batch([db(env, "INSERT INTO panorama_mutes VALUES(?,?,?) ON CONFLICT(user) DO NOTHING", target, message.from.id, clock()), db(env, "DELETE FROM location_upload_sessions WHERE user=?", target)]));
+        return reply(message, `Добавление панорам для ${target} отключено. Вернуть доступ — /unmute ${target}.`);
+      }
     case "/reset_test_rounds":
       {
         if (!env.TELEGRAM_CHANNEL || env.TELEGRAM_CHANNEL === game.chat) {
@@ -1177,7 +1345,7 @@ function admin(env, ctx, message, command, args, updateId) {
       }
     case "/sync":
       {
-        if (env.MEDIA_SOURCE === "telegram") return reply(message, "Видео хранятся в Telegram. Добавление — /add, остаток — /inventory. Синхронизация с Drive не нужна.");
+        if (env.MEDIA_SOURCE === "telegram") return reply(message, "Панорамы хранятся в Telegram. Добавление — /add, остаток — /inventory. Синхронизация с Drive не нужна.");
         try {
           unwrap(verifyDrive(env));
           const location = unwrap(chooseLocation(env));
@@ -1256,6 +1424,25 @@ function admin(env, ctx, message, command, args, updateId) {
       return okay();
   }
 }
+function panoramaVote(env, callback, updateId) {
+  if (!callback.id || !Number.isSafeInteger(callback.from?.id) || !Number.isSafeInteger(updateId)) return okay();
+  const match = /^panorama_vote:(\d{1,15}):(-?1)$/.exec(callback.data || "");
+  if (!match || !validId(match[1])) return okay();
+  const roundId = Number(match[1]);
+  const vote = Number(match[2]);
+  const messageId = callback.message?.message_id;
+  const reveal = Number.isSafeInteger(messageId) && unwrap(db(env, `SELECT 1 FROM rounds r JOIN outbox o ON o.round=r.id
+    WHERE r.id=? AND r.status='closed' AND o.kind='reveal' AND o.status='sent' AND o.message_id=?`, roundId, messageId).first());
+  if (reveal) {
+    unwrap(db(env, `INSERT INTO panorama_votes VALUES(?,?,?,?,?) ON CONFLICT(round,user) DO UPDATE SET
+      vote=excluded.vote,updated=excluded.updated,update_id=excluded.update_id WHERE excluded.update_id>panorama_votes.update_id`, roundId, callback.from.id, vote, clock(), updateId).run());
+  }
+  return Response.json({
+    method: "answerCallbackQuery",
+    callback_query_id: callback.id,
+    text: reveal ? "Голос сохранён." : "Этот раунд сейчас нельзя оценить."
+  });
+}
 function webhook(env, ctx, request) {
   if (!env.WEBHOOK_SECRET || request.headers.get("X-Telegram-Bot-Api-Secret-Token") !== env.WEBHOOK_SECRET) {
     return new Response("Forbidden", {
@@ -1270,16 +1457,18 @@ function webhook(env, ctx, request) {
       status: 400
     });
   }
+  if (update.callback_query) return panoramaVote(env, update.callback_query, update.update_id);
   const message = update.message;
   if (message?.chat?.type !== "private" || !Number.isSafeInteger(message.from?.id)) return okay();
   const user = message.from.id;
   const [raw, ...tokens] = (message.text || "").trim().split(/\s+/);
   const args = tokens.join(" ");
   const command = raw.startsWith("/") ? raw.split("@")[0] : "";
-  const addition = unwrap(addLocation(env, message, command, coordinates, weekCoverageText));
+  if (["/moderation", "/mute", "/unmute"].includes(command)) return admin(env, ctx, message, command, args, update.update_id);
+  const addition = unwrap(addLocation(env, message, command, locationPoint, weekCoverageText));
   if (addition !== null) return reply(message, addition);
   if (command === "/start") {
-    if (!args) return reply(message, `Открой раунд по кнопке под постом в группе.\n\nТвой Telegram ID: ${user}`);
+    if (!args) return reply(message, `Открой раунд по кнопке под постом в группе. Хочешь предложить панораму? Напиши /add.\n\nТвой Telegram ID: ${user}`);
     const suffix = args.startsWith(roundLinkPrefix) ? args.slice(roundLinkPrefix.length) : "";
     const id = validId(suffix) ? Number(suffix) : 0;
     const round = unwrap(db(env, "SELECT * FROM rounds WHERE id=?", id).first());
@@ -1289,6 +1478,9 @@ function webhook(env, ctx, request) {
     }
     unwrap(db(env, "INSERT INTO selected VALUES(?,?) ON CONFLICT(user) DO UPDATE SET round=excluded.round", user, id).run());
     if (round.status !== "active" || clock() >= round.ends) return reply(message, expired);
+    if (round.author_points != null && (round.author_user ?? Number(uploadOwner(env))) === user) {
+      return reply(message, `Твой авторский результат уже учтён: ${round.author_points} / 5000.`);
+    }
     if (unwrap(db(env, "SELECT 1 FROM guesses WHERE round=? AND user=?", id, user).first())) return reply(message, duplicate);
     return reply(message, `Раунд #${id}. Открой «Вложения → Геопозиция», выбери точку на карте и отправь её сюда.`);
   }
@@ -1303,6 +1495,9 @@ function webhook(env, ctx, request) {
   const name = [message.from.first_name, message.from.last_name].filter(Boolean).join(" ");
   const now = clock();
   if (round.status !== "active" || round.ends <= now) return reply(message, expired);
+  if (round.author_points != null && (round.author_user ?? Number(uploadOwner(env))) === user) {
+    return reply(message, `Твой авторский результат уже учтён: ${round.author_points} / 5000.`);
+  }
   const {
     km,
     points
@@ -1539,5 +1734,5 @@ function appsScriptSchedule(request, env) {
   unwrap(unwrap(gasAll(work)));
   return okay();
 }
-return { coordinates, filenameLocation, filenameCoordinates, score, activeSlots, remainingWeekSlots, weekCoverage, weekCoverageText, weeklyWindow, monthlyWindow, leaderboard, weeklySummary, monthlySummary, publish, tick, webhook, inventory, scanLocations, mediaMetadata, driveToken, resetTestRounds, GoogleDatabase };
+return { coordinates, filenameLocation, filenameCoordinates, score, activeSlots, remainingWeekSlots, weekCoverage, weekCoverageText, weeklyWindow, monthlyWindow, leaderboard, weeklySummary, monthlySummary, publish, tick, webhook, inventory, scanLocations, mediaMetadata, driveToken, resetTestRounds, GoogleDatabase, migrateCommunityPanoramas };
 }
